@@ -10,13 +10,14 @@ WorkingDirectory=%h/.hermes/profiles/hermes-admin/deployments/hermes-desktop-web
 Environment=PREVIEW_BIND=127.0.0.1,172.17.0.1
 Environment=PREVIEW_PORT=18091
 Environment=PREVIEW_CDP_PORT=9340
-Environment=PREVIEW_PROFILE_DIR=%h/.hermes/profiles/hermes-admin/browser-preview-profile
+Environment=PREVIEW_PROFILE_BASE=%h/.hermes/profiles/hermes-admin/browser-preview-profiles
+Environment=PREVIEW_MAX_BROWSERS=8
 Environment=PREVIEW_MAX_PANES=8
 ExecStart=/usr/bin/python3 -I relay.py
 Restart=on-failure
 RestartSec=3
-TasksMax=2048
-MemoryMax=2G
+TasksMax=8192
+MemoryMax=6G
 KillMode=mixed
 TimeoutStopSec=15
 NoNewPrivileges=true

@@ -76,7 +76,10 @@
     // ---- transport -------------------------------------------------------
     _connect() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const ws = new WebSocket(`${proto}//${location.host}${RELAY_PATH}`)
+      // Each profile window loads with ?profile=<name>; the relay keeps a
+      // separate browser (cookies, logins, storage) per profile.
+      const profile = new URLSearchParams(location.search).get('profile') || 'default'
+      const ws = new WebSocket(`${proto}//${location.host}${RELAY_PATH}?profile=${encodeURIComponent(profile)}`)
       this._ws = ws
       ws.onopen = () => {}
       ws.onmessage = ev => this._onMessage(JSON.parse(ev.data))

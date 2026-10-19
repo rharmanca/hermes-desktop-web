@@ -18,11 +18,13 @@ import base64
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -32,10 +34,15 @@ from websockets.asyncio.server import serve
 LOG = logging.getLogger("preview-relay")
 
 CHROMIUM = os.environ.get("PREVIEW_CHROMIUM", "/usr/lib/chromium/chromium")
-PROFILE_DIR = Path(os.environ.get(
-    "PREVIEW_PROFILE_DIR",
-    Path.home() / ".hermes/profiles/hermes-admin/browser-preview-profile"))
-CDP_PORT = int(os.environ.get("PREVIEW_CDP_PORT", "9340"))
+# One Chromium (own cookies/storage, own CDP port) per Hermes profile, started on
+# first use, under PREVIEW_PROFILE_BASE/<profile>. The pane says which profile
+# window it belongs to via ?profile=...; unknown/invalid names use "default".
+PROFILE_BASE = Path(os.environ.get(
+    "PREVIEW_PROFILE_BASE",
+    Path.home() / ".hermes/profiles/hermes-admin/browser-preview-profiles"))
+CDP_PORT = int(os.environ.get("PREVIEW_CDP_PORT", "9340"))        # first port; +1 per browser
+MAX_BROWSERS = int(os.environ.get("PREVIEW_MAX_BROWSERS", "8"))
+PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 BIND_HOSTS = [h for h in os.environ.get("PREVIEW_BIND", "127.0.0.1,172.17.0.1").split(",") if h]
 BIND_PORT = int(os.environ.get("PREVIEW_PORT", "18091"))
 MAX_PANES = int(os.environ.get("PREVIEW_MAX_PANES", "8"))
@@ -45,18 +52,27 @@ MODIFIER_BITS = {"alt": 1, "control": 2, "ctrl": 2, "meta": 4, "shift": 8}
 
 # ---------------------------------------------------------------- chromium --
 class Chromium:
-    def __init__(self):
+    def __init__(self, profile, port):
+        self.profile = profile
+        self.dir = PROFILE_BASE / profile
+        self.port = port
         self.proc = None
+        self.lock = asyncio.Lock()
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
 
     def start(self):
-        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-        os.chmod(PROFILE_DIR, 0o700)
+        PROFILE_BASE.mkdir(parents=True, exist_ok=True)
+        os.chmod(PROFILE_BASE, 0o700)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.dir, 0o700)
         args = [
             CHROMIUM, "--headless=new", "--disable-gpu", "--disable-dev-shm-usage",
             "--no-first-run", "--no-default-browser-check", "--disable-default-apps",
             "--disable-extensions", "--hide-scrollbars=false", "--mute-audio",
-            f"--remote-debugging-port={CDP_PORT}", "--remote-debugging-address=127.0.0.1",
-            f"--user-data-dir={PROFILE_DIR}", "--window-size=1280,800", "about:blank",
+            f"--remote-debugging-port={self.port}", "--remote-debugging-address=127.0.0.1",
+            f"--user-data-dir={self.dir}", "--window-size=1280,800", "about:blank",
         ]
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                      start_new_session=True)
@@ -65,27 +81,24 @@ class Chromium:
                 raise RuntimeError(f"chromium exited early ({self.proc.returncode})")
             try:
                 self.version()
-                LOG.info("chromium ready on 127.0.0.1:%d (profile %s)", CDP_PORT, PROFILE_DIR)
+                LOG.info("chromium ready on 127.0.0.1:%d (profile %s)", self.port, self.profile)
                 return
             except Exception:
                 time.sleep(0.2)
         raise RuntimeError("chromium did not come up")
 
-    @staticmethod
-    def version():
-        with urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}/json/version", timeout=2) as r:
+    def version(self):
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json/version", timeout=2) as r:
             return json.load(r)
 
-    @staticmethod
-    def new_target():
-        req = urllib.request.Request(f"http://127.0.0.1:{CDP_PORT}/json/new?about:blank", method="PUT")
+    def new_target(self):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/json/new?about:blank", method="PUT")
         with urllib.request.urlopen(req, timeout=5) as r:
             return json.load(r)
 
-    @staticmethod
-    def close_target(target_id):
+    def close_target(self, target_id):
         try:
-            urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}/json/close/{target_id}", timeout=5).read()
+            urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json/close/{target_id}", timeout=5).read()
         except Exception:
             pass
 
@@ -98,15 +111,40 @@ class Chromium:
                 self.proc.kill()
 
 
-CHROME = Chromium()
+BROWSERS = {}   # profile -> Chromium
+
+
+def _port_free(port):
+    with socket.socket() as sk:
+        return sk.connect_ex(("127.0.0.1", port)) != 0
+
+
+async def browser_for(profile):
+    """The Chromium for this Hermes profile, launched on first use (or relaunched if it died)."""
+    if not PROFILE_RE.match(profile or ""):
+        profile = "default"
+    b = BROWSERS.get(profile)
+    if b is None:
+        if len(BROWSERS) >= MAX_BROWSERS:
+            raise RuntimeError("too many preview browsers")
+        used = {x.port for x in BROWSERS.values()}
+        port = CDP_PORT
+        while port in used or not _port_free(port):
+            port += 1
+        b = BROWSERS[profile] = Chromium(profile, port)
+    async with b.lock:
+        if not b.alive():
+            await asyncio.to_thread(b.start)
+    return b
 
 
 # --------------------------------------------------------------------- pane --
 class Pane:
     """One renderer <webview> <-> one Chromium tab."""
 
-    def __init__(self, client):
+    def __init__(self, client, browser):
         self.client = client
+        self.browser = browser
         self.target = None
         self.cdp = None
         self.seq = 0
@@ -117,7 +155,7 @@ class Pane:
         self.closed = False
 
     async def open(self):
-        self.target = CHROME.new_target()
+        self.target = self.browser.new_target()
         self.cdp = await websockets.connect(self.target["webSocketDebuggerUrl"], max_size=32 * 1024 * 1024)
         # The pump must never await a CDP reply itself (it is the only reader),
         # so events go through a queue to a separate dispatcher task.
@@ -344,7 +382,7 @@ class Pane:
                 t.cancel()
         finally:
             if self.target:
-                CHROME.close_target(self.target["id"])
+                self.browser.close_target(self.target["id"])
 
 
 # ------------------------------------------------------------------- server --
@@ -359,12 +397,18 @@ async def ws_handler(ws):
     if len(PANES) >= MAX_PANES:
         await ws.close(code=1013, reason="too many preview panes")
         return
-    pane = Pane(ws)
-    PANES.add(pane)
-    LOG.info("pane open (%d active) from %s", len(PANES), ws.remote_address)
+    q = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+    profile = (q.get("profile") or ["default"])[0]
+    if not PROFILE_RE.match(profile):
+        profile = "default"
+    pane = None
     try:
+        browser = await browser_for(profile)
+        pane = Pane(ws, browser)
+        PANES.add(pane)
+        LOG.info("pane open (%d active) profile=%s from %s", len(PANES), profile, ws.remote_address)
         await pane.open()
-        await ws.send(json.dumps({"event": "ready", "webContentsId": CDP_PORT * 1000 + len(PANES)}))
+        await ws.send(json.dumps({"event": "ready", "webContentsId": browser.port * 1000 + len(PANES)}))
         async for raw in ws:
             m = json.loads(raw)
             rid = m.get("id")
@@ -382,19 +426,22 @@ async def ws_handler(ws):
     except Exception as exc:
         LOG.warning("pane error: %s", exc)
     finally:
-        PANES.discard(pane)
-        await pane.close()
+        if pane is not None:
+            PANES.discard(pane)
+            await pane.close()
         LOG.info("pane closed (%d active)", len(PANES))
 
 
 async def process_request(connection, request):
     if request.path == "/healthz":
-        try:
-            v = CHROME.version()
-            body = json.dumps({"ok": True, "browser": v.get("Browser"), "panes": len(PANES)}).encode()
-            return connection.respond(200, body.decode() + "\n")
-        except Exception as exc:
-            return connection.respond(503, json.dumps({"ok": False, "error": str(exc)}) + "\n")
+        browsers = {}
+        for name, b in BROWSERS.items():
+            try:
+                browsers[name] = {"port": b.port, "browser": b.version().get("Browser")}
+            except Exception as exc:
+                browsers[name] = {"port": b.port, "error": str(exc)}
+        body = json.dumps({"ok": True, "panes": len(PANES), "browsers": browsers})
+        return connection.respond(200, body + "\n")
     if not request.path.startswith("/ws"):
         return connection.respond(404, "not found\n")
     return None
@@ -402,7 +449,6 @@ async def process_request(connection, request):
 
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
-    CHROME.start()
     stop = asyncio.get_running_loop().create_future()
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, lambda: not stop.done() and stop.set_result(None))
@@ -411,11 +457,13 @@ async def main():
                      max_size=4 * 1024 * 1024, ping_interval=20, ping_timeout=20):
         LOG.info("preview relay listening on %s:%d", ",".join(BIND_HOSTS), BIND_PORT)
         await stop
-    CHROME.stop()
+    for b in BROWSERS.values():
+        b.stop()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     finally:
-        CHROME.stop()
+        for b in BROWSERS.values():
+            b.stop()
