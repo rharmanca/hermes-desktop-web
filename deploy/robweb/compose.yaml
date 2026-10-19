@@ -1,0 +1,42 @@
+name: hermes-desktop-web
+services:
+  desktop-web:
+    image: hermes-desktop-web:0.22.0-5e9d937
+    pull_policy: never
+    container_name: hermes-desktop-web
+    restart: unless-stopped
+    network_mode: bridge
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - "127.0.0.1:18090:8080"
+    user: "101:101"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: "1.0"
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ && wget -q -O /dev/null http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+      start_interval: 3s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+      hermes.application: hermes-desktop-web
+      hermes.adapter.commit: 5e9d93705160ae7d4610316ef4feaf05191e7244
+      hermes.renderer.commit: e06df9c2eae6901f4c88f464e0ae6e753c0428b8
+      hermes.access: loopback-only
