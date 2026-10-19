@@ -144,6 +144,8 @@ class Pane:
                                 everyNthFrame=1)
                 return
             except Exception as exc:
+                if "already active" in str(exc):
+                    return  # stream is running; nothing to re-arm
                 last = exc
                 await asyncio.sleep(0.15 * (attempt + 1))
         raise RuntimeError(f"screencast failed: {last}")
