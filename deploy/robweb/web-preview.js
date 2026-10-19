@@ -196,6 +196,11 @@
         ev.preventDefault()
       }, { passive: false })
       const mods = ev => ['alt', 'control', 'meta', 'shift'].filter(k => ev[k + 'Key'])
+      // Keys typed in the pane belong to the page, not the chat composer
+      // (the app focuses the composer on stray keystrokes).
+      for (const type of ['keydown', 'keyup', 'keypress', 'beforeinput', 'input']) {
+        img.addEventListener(type, ev => ev.stopPropagation())
+      }
       img.addEventListener('keydown', ev => {
         const printable = ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey
         this._send({ op: 'input', event: { type: 'keyDown', key: ev.key, code: ev.code, keyCode: ev.key, vk: ev.keyCode, modifiers: mods(ev), text: printable ? ev.key : (ev.key === 'Enter' ? '\r' : undefined) } })

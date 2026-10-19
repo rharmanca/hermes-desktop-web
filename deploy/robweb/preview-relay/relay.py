@@ -70,6 +70,10 @@ def url_is_private(url):
     return not ip.is_global
 
 
+KEY_VK = {"Enter": 13, "Return": 13, "Tab": 9, "Backspace": 8, "Escape": 27, "Delete": 46, "Insert": 45,
+          "ArrowLeft": 37, "ArrowUp": 38, "ArrowRight": 39, "ArrowDown": 40, "Home": 36, "End": 35,
+          "PageUp": 33, "PageDown": 34, " ": 32, "Space": 32, "Shift": 16, "Control": 17, "Alt": 18, "Meta": 91}
+KEY_TEXT = {"Enter": "\r", "Return": "\r", "Tab": "\t", " ": " ", "Space": " "}
 MODIFIER_BITS = {"alt": 1, "control": 2, "ctrl": 2, "meta": 4, "shift": 8}
 
 
@@ -396,11 +400,12 @@ class Pane:
                 params["text"] = str(e.get("keyCode", ""))[:4]
                 params["type"] = "char"
             else:
-                params.update(key=e.get("key", e.get("keyCode", "")), code=e.get("code", ""),
-                              windowsVirtualKeyCode=int(e.get("vk", 0)) or None,
-                              nativeVirtualKeyCode=int(e.get("vk", 0)) or None)
+                key = str(e.get("key", e.get("keyCode", "")))
+                vk = int(e.get("vk", 0) or 0) or KEY_VK.get(key) or (ord(key.upper()) if len(key) == 1 else 0)
+                params.update(key=key, code=e.get("code", "") or (f"Key{key.upper()}" if len(key) == 1 and key.isalpha() else ""),
+                              windowsVirtualKeyCode=vk or None, nativeVirtualKeyCode=vk or None)
                 if t == "keyDown":
-                    text = e.get("text") or {"Enter": "\r", "Return": "\r", "Tab": "\t"}.get(str(params["key"]))
+                    text = e.get("text") or KEY_TEXT.get(key) or (key if len(key) == 1 else None)
                     if text:
                         params["text"] = str(text)[:4]
                 params = {k: v for k, v in params.items() if v is not None}
