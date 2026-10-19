@@ -133,9 +133,20 @@ class Pane:
         await self.start_cast()
 
     async def start_cast(self):
-        await self.call("Page.startScreencast", format="jpeg", quality=JPEG_QUALITY,
-                        maxWidth=int(self.width * self.scale), maxHeight=int(self.height * self.scale),
-                        everyNthFrame=1)
+        # A navigation (e.g. the renderer's initial about:blank) can swap the
+        # page process mid-call ("Not attached to an active page"); retry so a
+        # lost race never leaves the pane frozen on its last frame.
+        last = None
+        for attempt in range(5):
+            try:
+                await self.call("Page.startScreencast", format="jpeg", quality=JPEG_QUALITY,
+                                maxWidth=int(self.width * self.scale), maxHeight=int(self.height * self.scale),
+                                everyNthFrame=1)
+                return
+            except Exception as exc:
+                last = exc
+                await asyncio.sleep(0.15 * (attempt + 1))
+        raise RuntimeError(f"screencast failed: {last}")
 
     async def resize(self, w, h, scale):
         self.width, self.height, self.scale = max(100, int(w)), max(100, int(h)), min(2.0, max(1.0, float(scale)))
@@ -212,6 +223,10 @@ class Pane:
             await self._title()
             await self._history()
         elif method == "Page.frameStoppedLoading" and p.get("frameId") == self.main_frame:
+            try:
+                await self.start_cast()
+            except Exception as exc:
+                LOG.info("screencast re-arm failed: %s", exc)
             await self.emit("did-stop-loading")
             await self._title()
             await self._history()
@@ -258,7 +273,10 @@ class Pane:
             await self.call("Page.navigate", url=url)
         elif op == "resize":
             await self.resize(m["width"], m["height"], m.get("scale", 1))
-            await self.call("Page.stopScreencast")
+            try:
+                await self.call("Page.stopScreencast")
+            except Exception:
+                pass
             await self.start_cast()
         elif op == "back":
             await self.history_step(-1)
