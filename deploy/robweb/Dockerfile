@@ -4,11 +4,15 @@
 FROM hermes-desktop-web-base:5e9d937-v0.22.0
 COPY --chmod=644 deploy/robweb/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --chmod=644 web-bridge.js /usr/share/nginx/html/web-bridge.js
+COPY --chmod=644 deploy/robweb/web-preview.js /usr/share/nginx/html/web-preview.js
 # Cache-bust: reference the bridge by content hash so CDN/browser caches can never serve a stale copy.
 USER root
 RUN set -e; H=$(sha256sum /usr/share/nginx/html/web-bridge.js | cut -c1-12); \
     sed -i "s#src=\"./web-bridge.js\"#src=\"./web-bridge.js?v=$H\"#" /usr/share/nginx/html/index.html; \
-    grep -q "web-bridge.js?v=$H" /usr/share/nginx/html/index.html
+    grep -q "web-bridge.js?v=$H" /usr/share/nginx/html/index.html; \
+    P=$(sha256sum /usr/share/nginx/html/web-preview.js | cut -c1-12); \
+    sed -i "s#<script type=\"module\"#<script src=\"./web-preview.js?v=$P\"></script><script type=\"module\"#" /usr/share/nginx/html/index.html; \
+    grep -q "web-preview.js?v=$P" /usr/share/nginx/html/index.html
 USER nginx
 LABEL org.opencontainers.image.title="Hermes Desktop Web - local browser interface"
 LABEL org.opencontainers.image.source="https://github.com/Ohrest88/hermes-desktop-web"
