@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import signal
+import ipaddress
 import socket
 import subprocess
 import sys
@@ -47,6 +48,28 @@ BIND_HOSTS = [h for h in os.environ.get("PREVIEW_BIND", "127.0.0.1,172.17.0.1").
 BIND_PORT = int(os.environ.get("PREVIEW_PORT", "18091"))
 MAX_PANES = int(os.environ.get("PREVIEW_MAX_PANES", "8"))
 JPEG_QUALITY = int(os.environ.get("PREVIEW_JPEG_QUALITY", "70"))
+BLOCKED_HOSTS = {"localhost", "host.docker.internal", "metadata.google.internal"}
+
+
+def url_is_private(url):
+    """True for loopback/LAN/link-local/metadata targets: the preview must not reach the
+    host's own services (Hermes backend, other profiles' Chrome debug ports, docker bridge)."""
+    try:
+        u = urllib.parse.urlsplit(url)
+    except Exception:
+        return True
+    if u.scheme not in ("http", "https"):
+        return u.scheme not in ("about", "data", "blob")
+    host = (u.hostname or "").strip("[]").lower()
+    if not host or host in BLOCKED_HOSTS or host.endswith((".localhost", ".internal", ".local", ".ts.net")):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return not ip.is_global
+
+
 MODIFIER_BITS = {"alt": 1, "control": 2, "ctrl": 2, "meta": 4, "shift": 8}
 
 
@@ -164,6 +187,7 @@ class Pane:
         await self.call("Page.enable")
         await self.call("Runtime.enable")
         await self.call("Network.enable")
+        await self.call("Fetch.enable", patterns=[{"urlPattern": "*"}])
         await self.call("Emulation.setFocusEmulationEnabled", enabled=True)
         tree = await self.call("Page.getFrameTree")
         self.main_frame = tree["frameTree"]["frame"]["id"]
@@ -241,6 +265,13 @@ class Pane:
             pass
 
     async def _event(self, method, p):
+        if method == "Fetch.requestPaused":
+            rid = p["requestId"]
+            if url_is_private(p["request"]["url"]):
+                await self.call("Fetch.failRequest", requestId=rid, errorReason="AccessDenied")
+            else:
+                await self.call("Fetch.continueRequest", requestId=rid)
+            return
         if method == "Page.screencastFrame":
             try:
                 await self.client.send(json.dumps({"frame": p["data"], "meta": p["metadata"]}))
@@ -310,6 +341,8 @@ class Pane:
             url = str(m.get("url", "")).strip()
             if not url.lower().startswith(("http://", "https://", "about:blank")):
                 raise ValueError("only http(s) URLs may be previewed")
+            if url != "about:blank" and url_is_private(url):
+                raise ValueError("private/internal addresses cannot be previewed")
             await self.call("Page.navigate", url=url)
         elif op == "resize":
             await self.resize(m["width"], m["height"], m.get("scale", 1))
@@ -325,8 +358,9 @@ class Pane:
         elif op == "reload":
             await self.call("Page.reload", ignoreCache=bool(m.get("ignoreCache")))
         elif op == "eval":
-            r = await self.call("Runtime.evaluate", expression=str(m.get("code", "")), awaitPromise=True,
-                                returnByValue=True, userGesture=True)
+            r = await asyncio.wait_for(
+                self.call("Runtime.evaluate", expression=str(m.get("code", "")), awaitPromise=True,
+                          returnByValue=True, userGesture=True, timeout=20000), 25)
             if "exceptionDetails" in r:
                 ex = r["exceptionDetails"]
                 raise RuntimeError(ex.get("exception", {}).get("description") or ex.get("text", "script error"))
@@ -365,9 +399,10 @@ class Pane:
                 params.update(key=e.get("key", e.get("keyCode", "")), code=e.get("code", ""),
                               windowsVirtualKeyCode=int(e.get("vk", 0)) or None,
                               nativeVirtualKeyCode=int(e.get("vk", 0)) or None)
-                if t == "keyDown" and e.get("text"):
-                    params["text"] = str(e["text"])[:4]
-                    params["type"] = "keyDown"
+                if t == "keyDown":
+                    text = e.get("text") or {"Enter": "\r", "Return": "\r", "Tab": "\t"}.get(str(params["key"]))
+                    if text:
+                        params["text"] = str(text)[:4]
                 params = {k: v for k, v in params.items() if v is not None}
             await self.call("Input.dispatchKeyEvent", **params)
         else:
@@ -397,6 +432,9 @@ async def ws_handler(ws):
     if len(PANES) >= MAX_PANES:
         await ws.close(code=1013, reason="too many preview panes")
         return
+    if len(BROWSERS) >= MAX_BROWSERS and (urllib.parse.parse_qs(urllib.parse.urlsplit(path).query).get("profile") or ["default"])[0] not in BROWSERS:
+        await ws.close(code=1013, reason="too many preview browsers")
+        return
     q = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
     profile = (q.get("profile") or ["default"])[0]
     if not PROFILE_RE.match(profile):
@@ -410,7 +448,13 @@ async def ws_handler(ws):
         await pane.open()
         await ws.send(json.dumps({"event": "ready", "webContentsId": browser.port * 1000 + len(PANES)}))
         async for raw in ws:
-            m = json.loads(raw)
+            try:
+                m = json.loads(raw)
+                if not isinstance(m, dict):
+                    raise ValueError("message must be an object")
+            except Exception as exc:
+                LOG.info("bad message ignored: %s", exc)
+                continue
             rid = m.get("id")
             try:
                 result = await pane.handle(m)

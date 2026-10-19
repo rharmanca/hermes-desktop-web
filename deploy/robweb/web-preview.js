@@ -192,7 +192,7 @@
       img.addEventListener('contextmenu', ev => ev.preventDefault())
       img.addEventListener('wheel', ev => {
         const p = this._point(ev)
-        this.sendInputEvent({ type: 'mouseWheel', ...p, deltaX: -ev.deltaX, deltaY: -ev.deltaY })
+        this.sendInputEvent({ type: 'mouseWheel', ...p, deltaX: ev.deltaX, deltaY: ev.deltaY })
         ev.preventDefault()
       }, { passive: false })
       const mods = ev => ['alt', 'control', 'meta', 'shift'].filter(k => ev[k + 'Key'])
