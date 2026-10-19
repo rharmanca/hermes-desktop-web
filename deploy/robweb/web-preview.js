@@ -8,14 +8,26 @@
 // so the renderer needs no change.
 //
 // Loaded by index.html before the renderer bundle (see deploy/robweb/Dockerfile).
+
 ;(() => {
-  if (typeof window === 'undefined' || window.customElements.get('webview')) return
+  if (typeof window === 'undefined' || window.__hermesWebPreview) return
+  window.__hermesWebPreview = true
 
   const RELAY_PATH = '/preview-ws'
 
+  // "webview" is not a legal custom-element name (no hyphen), so we cannot
+  // customElements.define it. Instead we watch the DOM for <webview> tags the
+  // renderer creates and upgrade each one in place by swapping its prototype.
   class WebView extends HTMLElement {
-    constructor() {
-      super()
+    static adopt(el) {
+      if (el.__hermesPreview) return
+      el.__hermesPreview = true
+      Object.setPrototypeOf(el, WebView.prototype)
+      el._init()
+      el._attach()
+    }
+
+    _init() {
       this._ws = null
       this._seq = 0
       this._pending = new Map()
@@ -36,25 +48,29 @@
       this._img.style.cssText =
         'display:block;width:100%;height:100%;object-fit:fill;user-select:none;-webkit-user-drag:none;cursor:default;outline:none;background:#fff'
       this._img.tabIndex = 0
+      this._attrObs = new MutationObserver(ms => {
+        for (const m of ms) if (m.attributeName === 'src') this._onSrc(this.getAttribute('src'))
+      })
     }
 
-    connectedCallback() {
+    _attach() {
       if (!this.style.display) this.style.display = 'block'
       if (!this._img.isConnected) this.appendChild(this._img)
       this._bindInput()
       this._ro = new ResizeObserver(() => this._syncSize())
       this._ro.observe(this)
+      this._attrObs.observe(this, { attributes: true, attributeFilter: ['src'] })
       this._connect()
     }
 
-    disconnectedCallback() {
+    _detach() {
       this._ro?.disconnect()
+      this._attrObs?.disconnect()
       this._close()
     }
 
-    static get observedAttributes() { return ['src'] }
-    attributeChangedCallback(name, _old, value) {
-      if (name === 'src' && value) this._send({ op: 'navigate', url: value })
+    _onSrc(value) {
+      if (value) this._send({ op: 'navigate', url: value })
     }
 
     // ---- transport -------------------------------------------------------
@@ -224,5 +240,21 @@
     selectAll() { this._call({ op: 'eval', code: 'document.execCommand("selectAll")' }).catch(() => {}) }
   }
 
-  window.customElements.define('webview', WebView)
+  const scan = root => {
+    if (root.nodeType !== 1) return
+    if (root.tagName === 'WEBVIEW') WebView.adopt(root)
+    for (const el of root.querySelectorAll('webview')) WebView.adopt(el)
+  }
+  const unscan = root => {
+    if (root.nodeType !== 1) return
+    if (root.__hermesPreview && !root.isConnected) root._detach()
+    for (const el of root.querySelectorAll('webview')) if (el.__hermesPreview) el._detach()
+  }
+  new MutationObserver(ms => {
+    for (const m of ms) {
+      m.addedNodes.forEach(scan)
+      m.removedNodes.forEach(unscan)
+    }
+  }).observe(document.documentElement, { childList: true, subtree: true })
+  scan(document.documentElement)
 })()
