@@ -18,6 +18,18 @@
   // "webview" is not a legal custom-element name (no hyphen), so we cannot
   // customElements.define it. Instead we watch the DOM for <webview> tags the
   // renderer creates and upgrade each one in place by swapping its prototype.
+  // Must be registered before the app bundle (this script is a classic script
+  // placed ahead of the module entry, so it wins capture order on window).
+  for (const type of ['keydown', 'keyup', 'keypress', 'beforeinput', 'input']) {
+    window.addEventListener(type, ev => {
+      const view = ev.target && ev.target.__hermesPreviewView
+      if (!view) return
+      ev.stopImmediatePropagation()
+      if (type === 'keydown') view._onKeyDown(ev)
+      else if (type === 'keyup') view._onKeyUp(ev)
+    }, true)
+  }
+
   class WebView extends HTMLElement {
     static adopt(el) {
       if (el.__hermesPreview) return
@@ -173,6 +185,18 @@
     }
 
     // ---- input -----------------------------------------------------------
+    _onKeyDown(ev) {
+      const mods = ['alt', 'control', 'meta', 'shift'].filter(k => ev[k + 'Key'])
+      const printable = ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey
+      this._send({ op: 'input', event: { type: 'keyDown', key: ev.key, code: ev.code, keyCode: ev.key, vk: ev.keyCode, modifiers: mods, text: printable ? ev.key : (ev.key === 'Enter' ? '\r' : undefined) } })
+      if (!['F5', 'F11', 'F12'].includes(ev.key) && !(ev.metaKey || ev.ctrlKey)) ev.preventDefault()
+    }
+
+    _onKeyUp(ev) {
+      const mods = ['alt', 'control', 'meta', 'shift'].filter(k => ev[k + 'Key'])
+      this._send({ op: 'input', event: { type: 'keyUp', key: ev.key, code: ev.code, keyCode: ev.key, vk: ev.keyCode, modifiers: mods } })
+    }
+
     _point(ev) {
       const r = this._img.getBoundingClientRect()
       return { x: Math.round(ev.clientX - r.left), y: Math.round(ev.clientY - r.top) }
@@ -196,19 +220,12 @@
         ev.preventDefault()
       }, { passive: false })
       const mods = ev => ['alt', 'control', 'meta', 'shift'].filter(k => ev[k + 'Key'])
-      // Keys typed in the pane belong to the page, not the chat composer
-      // (the app focuses the composer on stray keystrokes).
-      for (const type of ['keydown', 'keyup', 'keypress', 'beforeinput', 'input']) {
-        img.addEventListener(type, ev => ev.stopPropagation())
-      }
-      img.addEventListener('keydown', ev => {
-        const printable = ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey
-        this._send({ op: 'input', event: { type: 'keyDown', key: ev.key, code: ev.code, keyCode: ev.key, vk: ev.keyCode, modifiers: mods(ev), text: printable ? ev.key : (ev.key === 'Enter' ? '\r' : undefined) } })
-        if (!['F5', 'F11', 'F12'].includes(ev.key) && !(ev.metaKey || ev.ctrlKey) ) ev.preventDefault()
-      })
-      img.addEventListener('keyup', ev => {
-        this._send({ op: 'input', event: { type: 'keyUp', key: ev.key, code: ev.code, keyCode: ev.key, vk: ev.keyCode, modifiers: mods(ev) } })
-      })
+      // Keys typed in the pane belong to the page, not the chat composer.
+      // The app installs window-level *capture* key listeners (focus composer
+      // on stray keystrokes) which run before any listener on the image, so
+      // the forwarding + stopImmediatePropagation lives in the window-capture
+      // handler installed at script load (see installKeyCapture below).
+      img.__hermesPreviewView = this
       img.addEventListener('paste', ev => {
         const text = ev.clipboardData?.getData('text') || ''
         if (text) this._call({ op: 'eval', code: `(()=>{const a=document.activeElement;if(!a)return;const t=${JSON.stringify(text)};if('setRangeText' in a){a.setRangeText(t,a.selectionStart,a.selectionEnd,'end');a.dispatchEvent(new Event('input',{bubbles:true}))}else document.execCommand('insertText',false,t)})()` }).catch(() => {})
