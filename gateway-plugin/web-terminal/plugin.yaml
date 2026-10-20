@@ -1,0 +1,11 @@
+name: web-terminal
+version: "0.2.0"
+description: Gateway-side shell PTY endpoint for the Hermes Desktop web build (dashboard backend plugin; registers no agent hooks or tools)
+author: Ohrest88 (upstream) / rharmanca (robweb hardening)
+config_schema:
+  allowed_users:
+    type: list
+    required: true
+    description: >-
+      provider:user_id pairs (e.g. basic:<username>) allowed to open a host shell, exactly as
+      the dashboard auth layer stamps them. Unset means nobody - the terminal fails closed.
