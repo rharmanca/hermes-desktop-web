@@ -82,9 +82,22 @@ stays mounted until restart but the handler refuses).
 ## Tests
 
 ```bash
-cd <repo> && HERMES_HOME=~/.hermes PYTHONPATH=<hermes-agent> \
-  <hermes-agent>/.venv/bin/python -m pytest gateway-plugin/web-terminal/tests -q -o addopts=""
+mkdir -p /tmp/wt-home && cd <repo> && \
+  env -u HERMES_PROFILE HERMES_HOME=/tmp/wt-home PYTHONPATH=<hermes-agent> PYTHONDONTWRITEBYTECODE=1 \
+  <hermes-agent>/.venv/bin/python -m pytest gateway-plugin/web-terminal/tests -q -p no:cacheprovider -o addopts=""
 ```
+
+Use a throwaway `HERMES_HOME`; the tests never need a live home. `PYTHONPATH` must name the
+Hermes source checkout: without it the venv cannot import core helpers (e.g. `hermes_yaml`),
+so spawns are refused and many tests fail. That is the environment, not the plugin — the
+plugin still refuses safely in that state.
+
+`tests/test_qa_r1_r7_regressions.py` carries the independent QA probes for findings R1–R7
+(adapted to 0.2.1 interfaces only); every one must pass.
+
+**Correction note (0.2.1).** The WIP commit `bd0fde9` says "22 tests failing". That count came
+from a run without `PYTHONPATH` set to the Hermes source; with the command above all supplied
+tests pass on `bd0fde9`. The pushed history is left as is; this note supersedes that message.
 
 Several tests run against the real `hermes_cli`: the private-API contract
 (`test_real_core_still_satisfies_contract`), a real PTY spawned at the clamp
