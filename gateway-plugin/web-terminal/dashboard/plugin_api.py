@@ -13,29 +13,40 @@ Resize rides the dashboard's existing escape: ``ESC[RESIZE:cols;rows]``.
 
 Hardening (robweb build):
 
-* **Fail closed.** The plugin rides two private Hermes APIs
+* **Fail closed on the private API.** The plugin rides two private Hermes APIs
   (``web_server_chat._ws_auth_reason`` / ``_ws_request_is_allowed`` and
-  ``PtyBridge``). They are re-resolved on every upgrade; if either is missing
-  or has changed shape the upgrade is refused *before* ``accept()`` — a Hermes
-  update can only ever turn the terminal off, never open it up. Ordinary chat
-  is unaffected either way.
-* **Enabled-list check on the WS leg.** The dashboard's ``plugins.enabled``
-  gate is HTTP middleware, which never runs for WebSocket upgrades; the handler
-  repeats it so a plugin disabled while the server is up stops serving shells.
+  ``PtyBridge``). They are re-resolved on every upgrade and checked for the exact
+  shape this plugin was written against (synchronous callables; a 2-tuple from the
+  auth gate; exactly ``True`` from the origin gate). Anything else refuses *before*
+  ``accept()``. This is a contract check, not a guarantee: a future core change
+  that keeps the shape but changes the meaning cannot be detected here.
+* **Policy is read only from the launch home, only when readable.** ``plugins.enabled``
+  / ``plugins.disabled`` and ``allowed_users`` are read through ``load_config_readonly``;
+  a read or parse failure (Hermes then serves a *last-known-good* or default
+  ``FailedConfigRead``) and a request scoped to another profile's home both count
+  as "unreadable" and deny. A ``?profile=`` request is refused before the handler
+  reads any configuration (the dashboard's mount-level profile dependency has already
+  entered that profile's scope by then; the handler neither reads nor spawns under it).
 * **Owner only.** A dashboard login proves *a* user; a shell on the host needs
   *the* operator. The server-stamped ``provider:user_id`` must be listed in
   ``plugins.entries.web-terminal.settings.allowed_users`` — unset means nobody.
-* **Two shells at a time**, **20 minutes without keyboard input** closes a
-  shell (resize frames are layout, not typing, and do not reset that clock),
-  and the shell inherits the dashboard environment **minus Hermes-managed
-  secrets** (the same scrub the agent's own background commands get).
-* **Bounded input.** The dial-time size is clamped to the core resize ceiling
-  (``PtyBridge.spawn`` forwards raw values to ptyprocess, where anything above
-  65535 raises inside the *forked child*); one input frame is at most 64 KiB and
-  a client may send at most 1 MiB per 10 s. The dashboard-wide WebSocket limit
-  is the 384 MiB attachment ceiling — far too large for a shell.
-* **No ``?profile=`` routing.** The shell always runs in the dashboard's own
-  home; a dial that names a profile is refused before anything is spawned.
+  The process-internal WS credential never opens a shell, whatever the list says.
+* **Two shells at a time, counting shells still being torn down.** A slot is held
+  until the PTY's close sequence has finished, so a reconnect loop cannot stack
+  live-or-exiting shells past the cap.
+* **20 minutes without keyboard input** closes a shell. Resize controls are layout,
+  not typing — every ``ESC[RESIZE:..]`` in a frame is consumed and none resets the
+  clock. The idle watchdog runs on its own task, so a browser that stops reading
+  output cannot stall it; an output send that stalls for 30 s also ends the shell.
+* **Bounded input.** Dial-time size and every resize are clamped to the core resize
+  ceiling (``PtyBridge.spawn`` forwards raw values to ptyprocess, where anything
+  above 65535 raises inside the *forked child*); one input frame is at most 64 KiB;
+  at most 1 MiB of input per sliding 10 s window (10 one-second buckets, so the
+  effective window is 9–10 s). Residual: uvicorn's ``ws_max_size`` is the
+  dashboard-wide 384 MiB attachment ceiling and a message is reassembled before this
+  handler sees it; PTY output has no quota (a permitted command may print a lot).
+* **Environment:** the dashboard environment **minus Hermes-managed secrets** (the
+  same scrub the agent's own background commands get).
 * **Audit log** (``$HERMES_HOME/logs/web-terminal-audit.log``, JSON lines):
   open / close / deny / error with peer, identity, size, pid, duration and byte
   counts — never command text or terminal output.
@@ -47,6 +58,7 @@ import asyncio
 import contextlib
 import datetime as _dt
 import importlib
+import inspect
 import itertools
 import json
 import logging
@@ -66,10 +78,11 @@ router = APIRouter()
 _log = logging.getLogger("hermes_cli.web_server")
 
 PLUGIN_NAME = "web-terminal"
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.2.1"
 
 MAX_TERMINALS = 2
 IDLE_TIMEOUT_S = 20 * 60  # no keyboard input for this long -> the shell is closed (resize is not input)
+OUTPUT_STALL_TIMEOUT_S = 30.0  # one PTY->browser send blocked for this long -> the shell is closed
 # Dial-time size ceiling = hermes_cli.pty_bridge's resize clamp (_MAX_COLS / _MAX_ROWS), so the
 # first layout and every later resize agree. spawn() itself does not clamp: a value > 65535
 # reaches struct.pack in the forked child and the exception escapes there, not in this handler.
@@ -79,9 +92,12 @@ MAX_ROWS = 1000
 # attachment ceiling (384 MiB) and cannot be lowered per route, so bound it here.
 MAX_INPUT_FRAME_BYTES = 64 * 1024  # ponytail: one frame; a paste larger than this closes the shell
 INPUT_WINDOW_S = 10.0
+INPUT_WINDOW_BUCKETS = 10  # sliding window of INPUT_WINDOW_S in INPUT_WINDOW_BUCKETS buckets
 MAX_INPUT_BYTES_PER_WINDOW = 1024 * 1024
 _READ_TIMEOUT_S = 0.2
 _IDLE_BACKOFF_S = 0.05  # quiet terminal: yield instead of re-polling at once (mirrors core)
+_WATCHDOG_TICK_S = 1.0  # idle watchdog cadence (shortened automatically for a short IDLE_TIMEOUT_S)
+_CLOSE_TIMEOUT_S = 5.0  # bound on a WebSocket close handshake against a stalled peer
 
 # Same resize escape the dashboard's xterm.js sends (web_server_chat._RESIZE_RE).
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
@@ -90,22 +106,24 @@ _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 # browser banner agree on the cause. Auth/origin/disabled refusals happen before
 # accept() (the browser sees a 403 handshake); the rest are post-accept closes.
 CLOSE_AUTH = 4401        # bad / missing credential, or the core auth API is unavailable
-CLOSE_ORIGIN = 4403      # host / origin / peer not allowed
+CLOSE_ORIGIN = 4403      # host / origin / peer not allowed, or profile routing attempted
 CLOSE_FORBIDDEN = 4403   # authenticated, but not in allowed_users (same code as /api/pty "not allowed")
-CLOSE_DISABLED = 4404    # plugin not (or no longer) in plugins.enabled
+CLOSE_DISABLED = 4404    # plugin not (or no longer) in plugins.enabled, or policy unreadable
 CLOSE_IDLE = 4409        # closed after IDLE_TIMEOUT_S without keyboard input
 CLOSE_EXITED = 4410      # shell exited (mirrors /api/pty)
-CLOSE_BUSY = 1013        # terminal limit reached / PTY input stalled
+CLOSE_BUSY = 1013        # terminal limit reached / PTY input stalled / output to the browser stalled
 CLOSE_ERROR = 1011       # shell could not start
 CLOSE_TOO_BIG = 1009     # one input frame over MAX_INPUT_FRAME_BYTES
-CLOSE_POLICY = 1008      # more than MAX_INPUT_BYTES_PER_WINDOW within INPUT_WINDOW_S
+CLOSE_POLICY = 1008      # more than MAX_INPUT_BYTES_PER_WINDOW within the sliding window
 
 _CORE_MODULE = "hermes_cli.web_server_chat"
 _BRIDGE_REQUIRED = ("spawn", "is_available", "read", "write", "resize", "close", "is_alive")
 
-# Live terminals: slot key -> bookkeeping. One event loop, so no lock: the
-# check-then-reserve in ``terminal_ws`` has no await between the two steps.
+# Live terminals: slot key -> bookkeeping. A slot is held from admission until the PTY's
+# close sequence has FINISHED (the reaper thread releases it), so "active" means
+# live-or-closing. Mutated from the event loop and from reaper threads -> lock.
 _ACTIVE: dict[int, dict[str, Any]] = {}
+_ACTIVE_LOCK = threading.Lock()
 _SEQ = itertools.count(1)
 
 
@@ -113,18 +131,21 @@ _SEQ = itertools.count(1)
 
 def _core() -> Optional[Any]:
     """The dashboard's chat/PTY module, or ``None`` when it no longer exposes the
-    private API this plugin depends on.
+    private API this plugin depends on — in the shape this plugin was written against.
 
     Resolved on every call, never cached, so a failure cannot be masked by an
     earlier success. ``None`` means *refuse* — the terminal is the one feature
     that must not degrade to "open" when an upstream refactor moves the gate.
+    Both gates must be plain synchronous callables: an ``async`` gate would hand
+    back a coroutine object, which is truthy and would read as "allowed".
     """
     try:
         mod = importlib.import_module(_CORE_MODULE)
     except Exception:
         return None
     for name in ("_ws_auth_reason", "_ws_request_is_allowed"):
-        if not callable(getattr(mod, name, None)):
+        fn = getattr(mod, name, None)
+        if not callable(fn) or inspect.iscoroutinefunction(fn):
             return None
     bridge = getattr(mod, "PtyBridge", None)
     if bridge is None or any(not callable(getattr(bridge, n, None)) for n in _BRIDGE_REQUIRED):
@@ -134,37 +155,117 @@ def _core() -> Optional[Any]:
     return mod
 
 
-def _plugin_enabled() -> bool:
-    """Mirror ``web_server._plugin_api_runtime_gate`` for the WebSocket leg (HTTP
-    middleware does not run for WS upgrades): the plugin must still be in
-    ``plugins.enabled`` and not in ``plugins.disabled``. Any failure reads as disabled.
-    """
-    try:
-        from hermes_cli.plugins_cmd import _get_disabled_set, _get_enabled_set
-        enabled, disabled = _get_enabled_set(), _get_disabled_set()
-    except Exception:
-        return False
-    return PLUGIN_NAME in enabled and PLUGIN_NAME not in disabled
-
-
 def _ws_deny_reason(ws: WebSocket, core: Any) -> tuple[Optional[int], str]:
     """``(close_code, detail)`` when the upgrade must be refused, else ``(None, credential)``.
 
     Gate order and codes match ``_ws_gate``: credential first, then host/origin/peer.
-    An exception inside either core gate is a refusal, not a pass.
+    An exception inside either core gate is a refusal, not a pass; so is any result
+    that is not exactly the documented shape (``(reason, credential)`` / ``True``).
     """
     try:
-        auth_reason, cred = core._ws_auth_reason(ws)
-    except Exception as exc:  # shape drift (e.g. a bool return) or a gate crash
+        result = core._ws_auth_reason(ws)
+    except Exception as exc:  # a gate crash
         return CLOSE_AUTH, f"auth gate error: {type(exc).__name__}"
+    if not (isinstance(result, tuple) and len(result) == 2):
+        return CLOSE_AUTH, "auth gate error: unexpected result shape"
+    auth_reason, cred = result
     if auth_reason is not None:
         return CLOSE_AUTH, f"auth: {auth_reason}"
     try:
-        if not core._ws_request_is_allowed(ws):
-            return CLOSE_ORIGIN, "host/origin/peer not allowed"
+        allowed = core._ws_request_is_allowed(ws)
     except Exception as exc:
         return CLOSE_ORIGIN, f"origin gate error: {type(exc).__name__}"
+    if inspect.iscoroutine(allowed):
+        allowed.close()  # never awaited; a coroutine object is truthy, so it must not be judged by truth
+        return CLOSE_ORIGIN, "origin gate error: unexpected result shape"
+    if allowed is not True:  # exactly True: a tuple, an int or None is contract drift, not "allowed"
+        return CLOSE_ORIGIN, "host/origin/peer not allowed"
     return None, str(cred)
+
+
+# --- Policy (launch-home config, readable or nothing) --------------------------
+
+def _policy_config() -> Optional[dict[str, Any]]:
+    """The launch home's effective config, or ``None`` when it must not be trusted.
+
+    ``None`` (-> the caller denies) when: the config/plugins API cannot be imported; the
+    request is scoped to another profile's home (``?profile=`` routing sets a context-local
+    HERMES_HOME override — policy is only ever the dashboard's own); or the read is a
+    ``FailedConfigRead``, which is what Hermes serves after a parse/read failure: the
+    last-known-good or default config, i.e. stale permissions. Re-read on every call.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config_read_errors import FailedConfigRead
+        from hermes_constants import get_hermes_home_override, get_process_hermes_home
+    except Exception:
+        return None
+    override = get_hermes_home_override()
+    if override is not None:
+        try:
+            if Path(override).resolve() != Path(get_process_hermes_home()).resolve():
+                return None
+        except Exception:
+            return None
+    try:
+        cfg = load_config_readonly()
+    except Exception:
+        return None
+    if isinstance(cfg, FailedConfigRead) or not isinstance(cfg, dict):
+        return None
+    return cfg
+
+
+def _plugin_enabled() -> bool:
+    """Mirror ``web_server._plugin_api_runtime_gate`` for the WebSocket leg (HTTP middleware
+    does not run for WS upgrades): the plugin must be in ``plugins.enabled`` and not in
+    ``plugins.disabled`` — of a readable launch-home config. Anything else reads as disabled."""
+    cfg = _policy_config()
+    if cfg is None:
+        return False
+    plugins = cfg.get("plugins") or {}
+    enabled = plugins.get("enabled")
+    disabled = plugins.get("disabled") or []
+    if not isinstance(enabled, list) or not isinstance(disabled, list):
+        return False
+    return PLUGIN_NAME in enabled and PLUGIN_NAME not in disabled
+
+
+def _allowed_users() -> frozenset[str]:
+    """``plugins.entries.web-terminal.settings.allowed_users`` as ``provider:user_id`` strings
+    (e.g. ``basic:alice``). Unset, malformed, unreadable or foreign-scoped config -> empty ->
+    nobody: the shell stays off until the operator names who may open it."""
+    cfg = _policy_config()
+    if cfg is None:
+        return frozenset()
+    entries = (cfg.get("plugins") or {}).get("entries") or {}
+    raw = ((entries.get(PLUGIN_NAME) or {}).get("settings") or {}).get("allowed_users")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return frozenset()
+    out: set[str] = set()
+    for item in raw:
+        if isinstance(item, str):
+            provider, _, user = item.strip().partition(":")
+            if provider and user:
+                out.add(f"{provider}:{user}")
+    return frozenset(out)
+
+
+def _user_allowed(identity: dict[str, Any]) -> bool:
+    """True only for a server-stamped ``provider:user_id`` that is in ``allowed_users``.
+    No identity (``--insecure`` loopback mode stamps none) -> False."""
+    provider, user = identity.get("provider"), identity.get("user_id")
+    if not (isinstance(provider, str) and provider and isinstance(user, str) and user):
+        return False
+    return f"{provider}:{user}" in _allowed_users()
+
+
+def _profile_routed(params: Any) -> bool:
+    """A non-empty ``?profile=`` names another profile's config/secret scope. The shell belongs
+    to the dashboard's own home only; such a request is refused before any policy read."""
+    return bool((params.get("profile") or "").strip())
 
 
 # --- Audit log -----------------------------------------------------------------
@@ -213,39 +314,6 @@ def _http_identity(request: Request) -> dict[str, Any]:
     return {"user_id": getattr(sess, "user_id", None), "provider": getattr(sess, "provider", None)}
 
 
-def _allowed_users() -> frozenset[str]:
-    """``plugins.entries.web-terminal.settings.allowed_users`` as ``provider:user_id`` strings
-    (e.g. ``basic:alice``). Unset, malformed or unreadable config -> empty -> nobody: the shell
-    stays off until the operator names who may open it. Re-read on every dial, never cached here.
-    """
-    try:
-        from hermes_cli.config import load_config_readonly
-        entries = ((load_config_readonly() or {}).get("plugins") or {}).get("entries") or {}
-        raw = ((entries.get(PLUGIN_NAME) or {}).get("settings") or {}).get("allowed_users")
-    except Exception:
-        return frozenset()
-    if isinstance(raw, str):
-        raw = [raw]
-    if not isinstance(raw, (list, tuple)):
-        return frozenset()
-    out: set[str] = set()
-    for item in raw:
-        if isinstance(item, str):
-            provider, _, user = item.strip().partition(":")
-            if provider and user:
-                out.add(f"{provider}:{user}")
-    return frozenset(out)
-
-
-def _user_allowed(identity: dict[str, Any]) -> bool:
-    """True only for a server-stamped ``provider:user_id`` that is in ``allowed_users``.
-    No identity (e.g. ``--insecure`` loopback mode, or the internal credential) -> False."""
-    provider, user = identity.get("provider"), identity.get("user_id")
-    if not (isinstance(provider, str) and provider and isinstance(user, str) and user):
-        return False
-    return f"{provider}:{user}" in _allowed_users()
-
-
 # --- Shell ---------------------------------------------------------------------
 
 def _shell_argv() -> list[str]:
@@ -275,51 +343,121 @@ def _dimension(raw: Any, default: int, maximum: int) -> int:
     return min(n, maximum) if n >= 1 else default
 
 
-def _reap(bridge: Any) -> threading.Thread:
+class _InputBudget:
+    """Bounded sliding-window byte budget: ``buckets`` equal buckets over ``window_s``.
+    A burst straddling a bucket boundary is still counted (the window slides); memory is
+    O(buckets) whatever the frame size. Effective window: (buckets-1)/buckets .. 1 x window_s."""
+
+    def __init__(self, window_s: float, limit: int, buckets: int = INPUT_WINDOW_BUCKETS) -> None:
+        self.width = window_s / buckets
+        self.limit = limit
+        self.epochs: list[Optional[int]] = [None] * buckets
+        self.bytes: list[int] = [0] * buckets
+
+    def add(self, now: float, nbytes: int) -> bool:
+        """Record ``nbytes`` at ``now``; True when the window total now exceeds the limit."""
+        idx = int(now // self.width)
+        slot = idx % len(self.bytes)
+        if self.epochs[slot] != idx:
+            self.epochs[slot], self.bytes[slot] = idx, 0
+        self.bytes[slot] += nbytes
+        oldest = idx - len(self.bytes) + 1
+        total = sum(b for e, b in zip(self.epochs, self.bytes) if e is not None and e >= oldest)
+        return total > self.limit
+
+
+def _reserve_slot(peer: str) -> tuple[Optional[int], Optional[dict[str, Any]]]:
+    """Admit one shell if a slot is free. Check-and-reserve under the lock: the reaper
+    threads release slots concurrently with admission."""
+    with _ACTIVE_LOCK:
+        if len(_ACTIVE) >= MAX_TERMINALS:
+            return None, None
+        key = next(_SEQ)
+        slot: dict[str, Any] = {"key": key, "peer": peer, "opened": time.time(), "pid": None,
+                                "reaper": None}
+        _ACTIVE[key] = slot
+        return key, slot
+
+
+def _active_count() -> int:
+    with _ACTIVE_LOCK:
+        return len(_ACTIVE)
+
+
+def _release_slot(key: int) -> None:
+    with _ACTIVE_LOCK:
+        _ACTIVE.pop(key, None)
+
+
+def _reap(slot: dict[str, Any], bridge: Any) -> threading.Thread:
     """Close the PTY bridge off the event loop on a plain thread — never an executor
-    future. ``bridge.close()`` blocks (SIGHUP → SIGTERM → SIGKILL cadence), so it must
-    not run on the loop; but a ``run_in_executor``/``to_thread`` future is cancelled
-    along with the awaiting task at shutdown (uvicorn's, or the test client's), and a
-    not-yet-started work item is then silently dropped — the shell outlives the socket.
-    A daemon thread cannot be cancelled; ``close`` is idempotent so a double reap is safe."""
-    def _close() -> None:
-        with contextlib.suppress(Exception):
-            bridge.close()
-    thread = threading.Thread(target=_close, name="web-terminal-reap", daemon=True)
+    future — and release the slot only AFTER the close sequence has finished.
+
+    ``bridge.close()`` blocks (SIGHUP → SIGTERM → SIGKILL cadence), so it must not run on
+    the loop; but a ``run_in_executor``/``to_thread`` future is cancelled along with the
+    awaiting task at shutdown and a not-yet-started work item is silently dropped — the
+    shell would outlive the socket. A daemon thread cannot be cancelled. Single-flight per
+    slot: ``PtyBridge.close`` returns at once for a second concurrent caller, so a second
+    reaper must not be the one that releases the slot while the first is still signalling."""
+    with _ACTIVE_LOCK:
+        thread = slot.get("reaper")
+        if thread is not None:
+            return thread
+
+        def _close() -> None:
+            try:
+                with contextlib.suppress(Exception):
+                    bridge.close()
+            finally:
+                _release_slot(slot["key"])
+
+        thread = threading.Thread(target=_close, name="web-terminal-reap", daemon=True)
+        slot["reaper"] = thread
     thread.start()
     return thread
+
+
+async def _close_ws(ws: WebSocket, code: int, reason: str) -> None:
+    """Bounded close: a peer that has stopped reading can hold the close handshake open."""
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(ws.close(code=code, reason=reason[:120]), _CLOSE_TIMEOUT_S)
 
 
 async def _fail(ws: WebSocket, message: str, code: int = CLOSE_ERROR) -> None:
     """Post-accept failure: tell the user why (red line in xterm), then close."""
     with contextlib.suppress(Exception):
-        await ws.send_text(f"\r\n\x1b[31m{message}\x1b[0m\r\n")
-    with contextlib.suppress(Exception):
-        await ws.close(code=code, reason=message[:120])
+        await asyncio.wait_for(ws.send_text(f"\r\n\x1b[31m{message}\x1b[0m\r\n"), _CLOSE_TIMEOUT_S)
+    await _close_ws(ws, code, message)
 
 
 # --- Routes --------------------------------------------------------------------
 
 @router.get("/health")
-async def health():
+async def health(request: Request):
+    if _profile_routed(request.query_params):
+        return JSONResponse({"error": "profile routing not supported"}, status_code=403)
     core = _core()
     pty_ok = bool(core is not None and core.PtyBridge.is_available())
     return {
         "ok": core is not None and pty_ok,
         "contract_ok": core is not None,
         "pty_available": pty_ok,
-        "active": len(_ACTIVE),
+        "policy_readable": _policy_config() is not None,
+        "allowed_users_configured": bool(_allowed_users()),
+        "active": _active_count(),
         "limit": MAX_TERMINALS,
         "idle_timeout_seconds": IDLE_TIMEOUT_S,
-        "allowed_users_configured": bool(_allowed_users()),
         "version": PLUGIN_VERSION,
     }
 
 
 @router.get("/shell")
 async def shell_info(request: Request):
-    """Preflight for the web bridge: which shell/cwd a terminal would get. Owner-gated like
-    the dial — the host's working directory is not for every dashboard login."""
+    """Preflight for the web bridge: which shell/cwd a terminal would get. Same refusals as
+    the dial — no profile routing, owner only — the host's working directory is not for every
+    dashboard login, and never evaluated against another profile's allow-list."""
+    if _profile_routed(request.query_params):
+        return JSONResponse({"error": "profile routing not supported"}, status_code=403)
     if not _user_allowed(_http_identity(request)):
         return JSONResponse({"error": "not allowed"}, status_code=403)
     return {"shell": os.path.basename(_shell_argv()[0]), "cwd": os.getcwd()}
@@ -329,7 +467,17 @@ async def shell_info(request: Request):
 async def terminal_ws(ws: WebSocket) -> None:
     peer = ws.client.host if ws.client else "?"
 
-    # 1. Private-API contract (fail closed: no core gate -> no terminal, ever).
+    # 1. No profile routing — before ANY policy read. The dashboard mounts every plugin
+    #    route behind a ``?profile=`` scope dependency (HTTP and WS alike); by the time this
+    #    handler runs, a ``?profile=X`` request already sits in profile X's config/secret
+    #    scope. The handler must then neither read policy nor spawn: refuse.
+    if _profile_routed(ws.query_params):
+        _audit("deny", reason="profile_param", peer=peer)
+        _log.warning("web-terminal refused: profile routing not supported peer=%s", peer)
+        await ws.close(code=CLOSE_ORIGIN, reason="profile routing not supported")
+        return
+
+    # 2. Private-API contract (fail closed: no core gate -> no terminal, ever).
     core = _core()
     if core is None:
         _audit("deny", reason="core_contract", peer=peer)
@@ -338,14 +486,15 @@ async def terminal_ws(ws: WebSocket) -> None:
         await ws.close(code=CLOSE_AUTH, reason="terminal unavailable: dashboard API contract")
         return
 
-    # 2. Still enabled? (the HTTP-only runtime gate does not cover WS upgrades)
+    # 3. Still enabled, per a READABLE launch-home config? (the HTTP-only runtime gate does
+    #    not cover WS upgrades; a last-known-good fallback does not count as enabled)
     if not _plugin_enabled():
         _audit("deny", reason="disabled", peer=peer)
-        _log.warning("web-terminal refused: plugin disabled peer=%s", peer)
+        _log.warning("web-terminal refused: plugin disabled or policy unreadable peer=%s", peer)
         await ws.close(code=CLOSE_DISABLED, reason="web-terminal plugin disabled")
         return
 
-    # 3. Credential, then host/origin/peer — the dashboard's own gates.
+    # 4. Credential, then host/origin/peer — the dashboard's own gates.
     code, detail = _ws_deny_reason(ws, core)
     if code is not None:
         _audit("deny", reason=detail, peer=peer)
@@ -353,45 +502,53 @@ async def terminal_ws(ws: WebSocket) -> None:
         await ws.close(code=code, reason=detail[:120])
         return
     cred = detail
+    ident = _identity(ws)
 
-    # 3a. No profile routing. The dashboard mounts every plugin route behind a
-    #     ``?profile=`` scope dependency (HTTP and WS alike); a hand-crafted
-    #     ``?profile=X`` would run this handler — the shell's env scrub AND the
-    #     allowed_users lookup below — under profile X's config/secret scope. The
-    #     shell belongs to the dashboard's own home only, so refuse first.
-    if (ws.query_params.get("profile") or "").strip():
-        _audit("deny", reason="profile_param", peer=peer, **_identity(ws))
-        _log.warning("web-terminal refused: profile routing not supported peer=%s", peer)
-        await ws.close(code=CLOSE_ORIGIN, reason="profile routing not supported")
+    # 5. A shell comes from a browser-minted ticket or a verified user session — never from
+    #    the process-internal credential the server hands its own WS clients.
+    if cred == "internal":
+        _audit("deny", reason="internal_credential", peer=peer, **ident)
+        _log.warning("web-terminal refused: internal credential cannot open a shell peer=%s", peer)
+        await ws.close(code=CLOSE_FORBIDDEN, reason="not allowed to open a terminal")
         return
 
-    # 3b. Owner gate. The credential proved *a* dashboard user; a shell on the host needs
-    #     *the* operator. Identity is whatever the core gate stamped — never a client parameter.
-    ident = _identity(ws)
+    # 6. Owner gate. The credential proved *a* dashboard user; a shell on the host needs
+    #    *the* operator. Identity is whatever the core gate stamped — never a client parameter.
     if not _user_allowed(ident):
         _audit("deny", reason="not_allowed", peer=peer, **ident)
         _log.warning("web-terminal refused: user not in allowed_users peer=%s", peer)
         await ws.close(code=CLOSE_FORBIDDEN, reason="not allowed to open a terminal")
         return
 
-    # 4. Concurrency cap. Reserve the slot before the first await so two dials
-    #    racing past the check cannot both spawn.
-    if len(_ACTIVE) >= MAX_TERMINALS:
-        _audit("deny", reason="limit", peer=peer, active=len(_ACTIVE), limit=MAX_TERMINALS,
-               **_identity(ws))
+    # 7. Concurrency cap — live AND still-closing shells count.
+    key, slot = _reserve_slot(peer)
+    if key is None or slot is None:
+        _audit("deny", reason="limit", peer=peer, active=_active_count(), limit=MAX_TERMINALS, **ident)
         _log.warning("web-terminal refused: limit %d reached peer=%s", MAX_TERMINALS, peer)
         await ws.accept()
         await _fail(ws, f"terminal limit reached ({MAX_TERMINALS} open shells)", code=CLOSE_BUSY)
         return
-    key = next(_SEQ)
-    slot: dict[str, Any] = {"peer": peer, "opened": time.time(), "pid": None}
-    _ACTIVE[key] = slot
 
     bridge = None
-    pump: Optional[asyncio.Task] = None
+    tasks: list[asyncio.Task] = []
     loop = asyncio.get_running_loop()
-    state = {"last_input": loop.time(), "bytes_in": 0, "bytes_out": 0, "close": "client_disconnect",
-             "win_start": loop.time(), "win_bytes": 0}
+    state = {"last_input": loop.time(), "bytes_in": 0, "bytes_out": 0, "close": "client_disconnect"}
+    budget = _InputBudget(INPUT_WINDOW_S, MAX_INPUT_BYTES_PER_WINDOW)
+    teardown = asyncio.Event()  # set once the session is over, whatever the peer does next
+
+    async def _end(reason: str, code: int, text: str) -> None:
+        """Shared teardown trigger for the pump / watchdog / writer: record the first reason,
+        start the PTY reap at once, attempt a bounded close (so a live browser sees the code
+        and reason), then release the writer. A peer that has stopped reading may never
+        complete the close handshake or deliver a disconnect; the writer must not wait for
+        either — when the handler returns, the server closes the transport itself."""
+        if state["close"] == "client_disconnect":
+            state["close"] = reason
+        if bridge is not None:
+            _reap(slot, bridge)
+        await _close_ws(ws, code, text)
+        teardown.set()
+
     try:
         await ws.accept()
 
@@ -405,56 +562,64 @@ async def terminal_ws(ws: WebSocket) -> None:
             bridge = core.PtyBridge.spawn(_shell_argv(), cwd=cwd, env=_shell_env(), cols=cols, rows=rows)
         except Exception as exc:  # health: allow BLE001 -- PtyUnavailableError / OSError / scrub failure: close cleanly
             _log.warning("web-terminal spawn failed: %s: %s", type(exc).__name__, exc)
-            _audit("error", reason=f"spawn: {type(exc).__name__}", peer=peer, **_identity(ws))
+            _audit("error", reason=f"spawn: {type(exc).__name__}", peer=peer, **ident)
             await _fail(ws, "terminal could not start (see the dashboard log)")
             return
         slot["pid"] = getattr(bridge, "pid", None)
         _audit("open", peer=peer, cred=cred, pid=slot["pid"], cols=cols, rows=rows, cwd=cwd,
-               active=len(_ACTIVE), **_identity(ws))
+               active=_active_count(), **ident)
         _log.info("web-terminal opened peer=%s cred=%s pid=%s", peer, cred, slot["pid"])
 
         async def pump_pty_to_ws() -> None:
-            try:
-                while True:
-                    if loop.time() - state["last_input"] > IDLE_TIMEOUT_S:
-                        state["close"] = "idle_timeout"
-                        with contextlib.suppress(Exception):
-                            await ws.close(code=CLOSE_IDLE,
-                                           reason=f"closed after {IDLE_TIMEOUT_S // 60} min without input")
-                        return
-                    # bridge.read blocks up to the poll timeout in a worker thread; None = EOF.
-                    chunk = await asyncio.to_thread(bridge.read, _READ_TIMEOUT_S)
-                    if chunk is None:
-                        state["close"] = "shell_exited"
-                        with contextlib.suppress(Exception):
-                            await ws.close(code=CLOSE_EXITED, reason="shell exited")
-                        return
-                    if not chunk:
-                        await asyncio.sleep(_IDLE_BACKOFF_S)
-                        continue
-                    state["bytes_out"] += len(chunk)
-                    try:
-                        await ws.send_bytes(chunk)
-                    except Exception:
-                        # The writer may already have closed the socket for a reason of its
-                        # own (flood, oversized frame, stall); keep that reason for the audit.
-                        if state["close"] == "client_disconnect":
-                            state["close"] = "send_failed"
-                        return
-            finally:
-                # Reap here too (idempotent; plain thread, see _reap) and close the socket
-                # so the writer's ws.receive() unparks instead of hanging on a half-open
-                # browser socket.
-                _reap(bridge)
-                with contextlib.suppress(Exception):
-                    await ws.close()
+            while True:
+                # bridge.read blocks up to the poll timeout in a worker thread; None = EOF.
+                chunk = await asyncio.to_thread(bridge.read, _READ_TIMEOUT_S)
+                if chunk is None:
+                    await _end("shell_exited", CLOSE_EXITED, "shell exited")
+                    return
+                if not chunk:
+                    await asyncio.sleep(_IDLE_BACKOFF_S)
+                    continue
+                state["bytes_out"] += len(chunk)
+                try:
+                    await asyncio.wait_for(ws.send_bytes(chunk), OUTPUT_STALL_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    await _end("output_stalled", CLOSE_BUSY, "browser stopped reading output")
+                    return
+                except Exception:
+                    # The socket is gone or another task already closed it for a reason of
+                    # its own (flood, oversized frame, idle); keep that reason for the audit.
+                    await _end("send_failed", CLOSE_BUSY, "send failed")
+                    return
 
-        pump = asyncio.create_task(pump_pty_to_ws())
+        async def idle_watchdog() -> None:
+            # Its own task on purpose: a pump blocked in send_bytes() (browser not reading)
+            # must not be able to stall the idle check.
+            while True:
+                await asyncio.sleep(max(0.01, min(_WATCHDOG_TICK_S, IDLE_TIMEOUT_S / 4)))
+                if loop.time() - state["last_input"] > IDLE_TIMEOUT_S:
+                    await _end("idle_timeout", CLOSE_IDLE,
+                               f"closed after {IDLE_TIMEOUT_S // 60} min without input")
+                    return
+
+        tasks = [asyncio.create_task(pump_pty_to_ws()), asyncio.create_task(idle_watchdog())]
+        stop = asyncio.create_task(teardown.wait())
+        tasks.append(stop)
 
         while True:
+            recv = asyncio.create_task(ws.receive())
+            done, _ = await asyncio.wait({recv, stop}, return_when=asyncio.FIRST_COMPLETED)
+            if recv not in done:
+                # The session was ended by the pump or the watchdog. Do not wait for the
+                # peer's disconnect (a stalled peer never sends one): leave, so the server
+                # closes the transport when this handler returns.
+                recv.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await recv
+                break
             try:
-                msg = await ws.receive()
-            except RuntimeError:  # receive() after the pump already closed the socket
+                msg = recv.result()
+            except Exception:  # health: allow BLE001 -- receive() after close, or a transport error: the session is over
                 break
             if msg.get("type") == "websocket.disconnect":
                 break
@@ -465,57 +630,51 @@ async def terminal_ws(ws: WebSocket) -> None:
             if not raw:
                 continue
             if len(raw) > MAX_INPUT_FRAME_BYTES:
-                state["close"] = "input_too_large"
-                with contextlib.suppress(Exception):
-                    await ws.close(code=CLOSE_TOO_BIG, reason="input frame too large")
+                await _end("input_too_large", CLOSE_TOO_BIG, "input frame too large")
                 break
             now = loop.time()
-            if now - state["win_start"] >= INPUT_WINDOW_S:
-                state["win_start"], state["win_bytes"] = now, 0
-            state["win_bytes"] += len(raw)
-            if state["win_bytes"] > MAX_INPUT_BYTES_PER_WINDOW:
-                state["close"] = "input_flood"
-                with contextlib.suppress(Exception):
-                    await ws.close(code=CLOSE_POLICY, reason="input rate limit")
+            if budget.add(now, len(raw)):
+                await _end("input_flood", CLOSE_POLICY, "input rate limit")
                 break
-            # Resize escapes ride the input stream; consume them, forward the rest. A
-            # resize-only frame is layout, not typing: it must not reset the idle clock.
-            match = _RESIZE_RE.search(raw)
-            if match:
-                new_cols = _dimension(match.group(1), 0, MAX_COLS)
-                new_rows = _dimension(match.group(2), 0, MAX_ROWS)
-                if new_cols and new_rows:
-                    bridge.resize(new_cols, new_rows)
-                raw = raw[: match.start()] + raw[match.end():]
-                if not raw:
-                    continue
+            # Resize escapes ride the input stream: consume EVERY one, apply the last valid
+            # size, forward the rest. Resize-only frames are layout, not typing: they never
+            # reset the idle clock.
+            size: Optional[tuple[int, int]] = None
+            for m in _RESIZE_RE.finditer(raw):
+                c, r = _dimension(m.group(1), 0, MAX_COLS), _dimension(m.group(2), 0, MAX_ROWS)
+                if c and r:
+                    size = (c, r)
+            if size is not None:
+                bridge.resize(*size)
+            raw = _RESIZE_RE.sub(b"", raw)
+            if not raw:
+                continue
             state["last_input"] = now
             state["bytes_in"] += len(raw)
             if not await bridge.write(raw):
-                state["close"] = "input_stalled"
-                with contextlib.suppress(Exception):
-                    await ws.close(code=CLOSE_BUSY, reason="PTY input stalled")
+                await _end("input_stalled", CLOSE_BUSY, "PTY input stalled")
                 break
     except WebSocketDisconnect:
         pass
     finally:
         # Cancellation-safe teardown: the handler task is cancelled on server shutdown
         # (and by Starlette's TestClient), and a cancelled task gets CancelledError at
-        # its next await. So: every must-happen step runs synchronously FIRST — slot
-        # release, audit line, pump cancel, and the reap on a plain thread (never an
-        # executor future, which shutdown would discard) — and only then the
-        # best-effort await of the pump.
-        _ACTIVE.pop(key, None)
-        if bridge is not None:
+        # its next await. So: every must-happen step runs synchronously FIRST — audit
+        # line, task cancel, and the reap on a plain thread (never an executor future,
+        # which shutdown would discard; it releases the slot when the PTY is gone) — and
+        # only then the best-effort await of the tasks.
+        if bridge is None:
+            _release_slot(key)  # nothing to reap: the slot is free now
+        else:
             _audit("close", peer=peer, pid=slot["pid"], reason=state["close"],
                    duration_s=round(time.time() - slot["opened"], 1),
                    bytes_in=state["bytes_in"], bytes_out=state["bytes_out"],
-                   active=len(_ACTIVE), **_identity(ws))
+                   active=_active_count(), **ident)
             _log.info("web-terminal closed peer=%s pid=%s reason=%s", peer, slot["pid"], state["close"])
-        if pump is not None:
-            pump.cancel()
+        for t in tasks:
+            t.cancel()
         if bridge is not None:
-            _reap(bridge)
-        if pump is not None:
+            _reap(slot, bridge)
+        for t in tasks:
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await pump
+                await t

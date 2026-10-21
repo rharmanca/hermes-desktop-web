@@ -3,7 +3,7 @@
   "label": "Web Terminal",
   "description": "Gateway-side shell PTY endpoint for the Hermes Desktop web build (browser terminal tab)",
   "icon": "Terminal",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "tab": { "hidden": true },
   "api": "plugin_api.py"
 }
