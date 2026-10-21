@@ -70,26 +70,115 @@ def url_is_private(url):
     return not ip.is_global
 
 
+def _addr_ok(ip):
+    return ipaddress.ip_address(ip.split("%")[0]).is_global
+
+
+async def resolve_public(host, timeout=3.0):
+    """Resolve `host` once and return its addresses only if EVERY one is public.
+    Fail closed: errors, timeouts, empty answers and any private address -> None."""
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+        return [host.strip("[]")] if _addr_ok(host.strip("[]")) else None
+    except ValueError:
+        pass
+    h = host.lower().rstrip(".")
+    if not h or h in BLOCKED_HOSTS or h.endswith((".localhost", ".internal", ".local", ".ts.net")):
+        return None
+    try:
+        infos = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(h, None, type=socket.SOCK_STREAM), timeout)
+        addrs = list(dict.fromkeys(i[4][0] for i in infos))
+    except Exception:
+        return None
+    if not addrs or not all(_addr_ok(a) for a in addrs):
+        return None
+    return addrs
+
+
 async def url_blocked(url):
-    """url_is_private plus DNS: a public-looking name (e.g. 127.0.0.1.nip.io) that resolves
-    to a loopback/LAN address is blocked too. Unresolvable names are allowed through
-    (Chromium will fail them itself)."""
+    """Early, user-friendly check for navigate (the egress proxy is the real enforcement)."""
     if url_is_private(url):
         return True
     u = urllib.parse.urlsplit(url)
     if u.scheme not in ("http", "https"):
         return False
-    host = (u.hostname or "").strip("[]").lower()
+    return await resolve_public(u.hostname or "") is None
+
+
+# ---------------------------------------------------------- egress proxy --
+# Every preview Chromium sends ALL traffic (pages, workers, popups, websockets)
+# through this proxy. It resolves the name once, checks every address, and then
+# connects to that exact checked address -- so DNS rebinding cannot swap in a
+# private address between the check and the connection.
+EGRESS_PORT = int(os.environ.get("PREVIEW_EGRESS_PORT", "18092"))
+ALLOWED_PORTS = None  # None = any port; private targets are blocked regardless
+
+
+async def _pipe(r, w):
     try:
-        ipaddress.ip_address(host)
-        return False  # literal IP already judged above
-    except ValueError:
-        pass
-    try:
-        infos = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(host, None), 5)
+        while data := await r.read(65536):
+            w.write(data)
+            await w.drain()
     except Exception:
-        return False
-    return any(not ipaddress.ip_address(i[4][0].split("%")[0]).is_global for i in infos)
+        pass
+    finally:
+        try:
+            w.close()
+        except Exception:
+            pass
+
+
+async def egress_handler(reader, writer, resolver=None):
+    resolver = resolver or resolve_public
+    try:
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 15)
+    except Exception:
+        writer.close(); return
+    line = head.split(b"\r\n", 1)[0].decode("latin1")
+    try:
+        method, target, _ = line.split(" ", 2)
+        if method.upper() == "CONNECT":
+            host, _, port = target.rpartition(":")
+            port, rest = int(port), b""
+        else:
+            u = urllib.parse.urlsplit(target)
+            if u.scheme != "http" or not u.hostname:
+                raise ValueError("bad target")
+            host, port = u.hostname, u.port or 80
+            # one request per upstream connection: a kept-alive proxy socket must not
+            # carry a later request for a different host to this checked address.
+            hdrs = [h for h in head.split(b"\r\n")[1:] if h and not h.lower().startswith((b"connection:", b"proxy-connection:", b"keep-alive:"))]
+            rest = b"\r\n".join([head.split(b"\r\n", 1)[0]] + hdrs + [b"Connection: close", b"", b""])
+    except Exception:
+        writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"); writer.close(); return
+    addrs = await resolver(host)
+    if not addrs:
+        LOG.info("egress blocked: %s:%s", host[:80], port)
+        writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        try: await writer.drain()
+        finally: writer.close()
+        return
+    try:
+        ur, uw = await asyncio.wait_for(asyncio.open_connection(addrs[0], port), 15)
+    except Exception:
+        writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"); writer.close(); return
+    if rest:
+        uw.write(rest)
+        await asyncio.gather(_pipe(ur, writer), _drain_to_close(reader, uw))
+        return
+    writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+    await asyncio.gather(_pipe(reader, uw), _pipe(ur, writer))
+
+
+async def _drain_to_close(reader, uw):
+    """Plain-HTTP mode: forward the request body. The upstream was told
+    `Connection: close`, so it answers once and closes; the client opens a new
+    proxy connection (and a new check) for its next request."""
+    try:
+        while data := await reader.read(65536):
+            uw.write(data); await uw.drain()
+    except Exception:
+        pass
 
 
 KEY_VK = {"Enter": 13, "Return": 13, "Tab": 9, "Backspace": 8, "Escape": 27, "Delete": 46, "Insert": 45,
@@ -121,7 +210,12 @@ class Chromium:
             "--no-first-run", "--no-default-browser-check", "--disable-default-apps",
             "--disable-extensions", "--hide-scrollbars=false", "--mute-audio",
             f"--remote-debugging-port={self.port}", "--remote-debugging-address=127.0.0.1",
-            f"--user-data-dir={self.dir}", "--window-size=1280,800", "about:blank",
+            f"--user-data-dir={self.dir}", "--window-size=1280,800",
+            # All network traffic goes through the checking egress proxy; "<-loopback>"
+            # removes Chromium's implicit loopback bypass so 127.0.0.1 is proxied (and refused) too.
+            f"--proxy-server=http://127.0.0.1:{EGRESS_PORT}", "--proxy-bypass-list=<-loopback>",
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--disable-features=DnsOverHttps", "about:blank",
         ]
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                      start_new_session=True)
@@ -152,12 +246,23 @@ class Chromium:
             pass
 
     def stop(self):
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+        # Chromium runs in its own process group; stop the whole group (zygote, renderers).
+        if not self.proc:
+            return
+        try:
+            pg = os.getpgid(self.proc.pid)
+        except ProcessLookupError:
+            return
+        for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 2)):
             try:
-                self.proc.wait(5)
+                os.killpg(pg, sig)
+            except ProcessLookupError:
+                return
+            try:
+                self.proc.wait(wait)
+                return
             except subprocess.TimeoutExpired:
-                self.proc.kill()
+                continue
 
 
 BROWSERS = {}   # profile -> Chromium
@@ -293,7 +398,7 @@ class Pane:
     async def _event(self, method, p):
         if method == "Fetch.requestPaused":
             rid = p["requestId"]
-            if await url_blocked(p["request"]["url"]):
+            if url_is_private(p["request"]["url"]):
                 await self.call("Fetch.failRequest", requestId=rid, errorReason="AccessDenied")
             else:
                 await self.call("Fetch.continueRequest", requestId=rid)
@@ -524,10 +629,20 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_running_loop().add_signal_handler(sig, lambda: not stop.done() and stop.set_result(None))
     # Explicit per-address binds: loopback (tests) + docker bridge (nginx in the container).
-    async with serve(ws_handler, host=BIND_HOSTS, port=BIND_PORT, process_request=process_request,
+    egress = await asyncio.start_server(egress_handler, "127.0.0.1", EGRESS_PORT)
+    LOG.info("egress proxy on 127.0.0.1:%d", EGRESS_PORT)
+    async with egress, serve(ws_handler, host=BIND_HOSTS, port=BIND_PORT, process_request=process_request,
                      max_size=4 * 1024 * 1024, ping_interval=20, ping_timeout=20):
         LOG.info("preview relay listening on %s:%d", ",".join(BIND_HOSTS), BIND_PORT)
         await stop
+        # Stop browsers first and drop open proxy connections; otherwise leaving the
+        # `async with` waits forever on Chromium's keep-alive proxy sockets.
+        LOG.info("shutting down")
+        for b in BROWSERS.values():
+            b.stop()
+        egress.close()
+        if hasattr(egress, "close_clients"):
+            egress.close_clients()
     for b in BROWSERS.values():
         b.stop()
 

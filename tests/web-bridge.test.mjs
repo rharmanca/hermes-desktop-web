@@ -108,7 +108,9 @@ test('expired edge sign-in: second failure within a minute does NOT reload again
   load({ routes, session }).bridge.getGatewayWsUrl().catch(() => {})
   await new Promise(r => setTimeout(r, 10))
   const second = load({ routes, session }) // simulates the page after reload
-  await assert.rejects(second.bridge.getGatewayWsUrl(), /Failed to fetch/)
+  const out = await Promise.race([second.bridge.getGatewayWsUrl().then(u => 'URL:' + u, e => 'ERR:' + e),
+    new Promise(r => setTimeout(() => r('pending'), 50))])
+  assert.equal(out, 'pending', 'must not hand the app an empty URL or an error that becomes the ws:// toast')
   assert.equal(second.location.reloads, 0)
 })
 

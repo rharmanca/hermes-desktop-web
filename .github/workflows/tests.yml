@@ -5,7 +5,6 @@ on:
   push:
     branches: [robweb, "wip/**"]
   pull_request:
-    branches: [robweb]
   workflow_dispatch:
 permissions:
   contents: read
@@ -28,7 +27,16 @@ jobs:
         run: node --test tests/*.test.mjs
       - name: Browser-pane relay filter tests
         run: python tests/relay/test_relay_filters.py
+      - name: Browser-pane relay end-to-end (real Chrome tries to reach private services)
+        run: |
+          python -m pip install -q websockets
+          PREVIEW_CHROMIUM="$(command -v google-chrome || command -v chromium)" python tests/relay/run_relay_e2e.py
       - name: Nginx config routing + header tests (throwaway containers)
         run: bash tests/nginx/run_nginx_tests.sh
+      - name: Web-terminal plugin tests (needs Hermes source; plugin stays disabled in production)
+        run: |
+          git clone -q --depth 1 --branch "${HERMES_REF:-v0.22.2}" https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
+          python -m pip install -q -e "$RUNNER_TEMP/hermes-agent[web]" pytest httpx || python -m pip install -q -e "$RUNNER_TEMP/hermes-agent" pytest httpx
+          HERMES_HOME="$RUNNER_TEMP/hh" PYTHONPATH="$RUNNER_TEMP/hermes-agent" python -m pytest gateway-plugin/web-terminal/tests -q -o addopts="" -p no:cacheprovider
       - name: Shell scripts lint
         run: shellcheck -S error tests/*.sh tests/nginx/*.sh

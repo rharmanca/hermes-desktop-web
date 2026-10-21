@@ -19,6 +19,9 @@ run "unit: browser-pane relay filters" python3 tests/relay/test_relay_filters.py
 if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
   run "config: nginx routing + headers" tests/nginx/run_nginx_tests.sh
 else skip "config: nginx routing + headers" "docker not available"; fi
+if [ -x "${PREVIEW_CHROMIUM:-/usr/lib/chromium/chromium}" ]; then
+  run "e2e: browser-pane relay with real Chromium" python3 tests/relay/run_relay_e2e.py
+else skip "e2e: browser-pane relay with real Chromium" "chromium not installed"; fi
 WT_PY="${HERMES_AGENT_SRC:-$HOME/.hermes/hermes-agent}/.venv/bin/python"
 if [ -x "$WT_PY" ]; then
   run "unit: web-terminal plugin (disabled in prod)" env HERMES_HOME="$(mktemp -d)" PYTHONPATH="${HERMES_AGENT_SRC:-$HOME/.hermes/hermes-agent}" \
@@ -33,4 +36,5 @@ if [ $BROWSER = 1 ]; then run "live: real browser" python3 tests/browser/run_bro
 else skip "live: real browser" "add --browser"; fi
 
 echo; echo "===== SUMMARY"; printf '%s\n' "${RESULTS[@]}"
-! printf '%s\n' "${RESULTS[@]}" | grep -q '^FAIL'
+for r in "${RESULTS[@]}"; do [[ $r == FAIL* ]] && exit 1; done
+exit 0

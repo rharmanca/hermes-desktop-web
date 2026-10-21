@@ -39,6 +39,9 @@ class App:
         self.page = ctx.new_page()
         self.errors, self.loads = [], 0
         self.page.on("pageerror", lambda e: self.errors.append(str(e)[:300]))
+        # evidence for intermittent "Failed to fetch": which requests failed, and how
+        self.failed = []
+        self.page.on("requestfailed", lambda r: self.failed.append(f"{r.method} {r.url[:120]} {r.failure}"))
         self.page.on("load", lambda *_: setattr(self, "loads", self.loads + 1))
 
     def open(self, path="/"):
@@ -52,7 +55,7 @@ class App:
     def assert_clean(self, where):
         bad = BAD_TEXT.search(self.text())
         check(not bad, f"{where}: error shown on screen: {bad.group(0) if bad else ''!r}")
-        check(not self.errors, f"{where}: page crashed: {self.errors[:2]}")
+        check(not self.errors, f"{where}: page crashed: {self.errors[:2]} failed requests: {self.failed[-5:]}")
 
     def profile_menu(self):
         self.page.get_by_role("button", name="Profiles", exact=True).click()
@@ -75,7 +78,7 @@ class App:
                 target = items.nth(i); break
         check(target is not None, f"profile {name!r} not in the Profiles menu")
         target.click()
-        time.sleep(2.5)
+        time.sleep(float(os.environ.get("SWITCH_WAIT","2.5")))
         self.page.wait_for_selector(COMPOSER, timeout=30000)
 
     def close(self):
@@ -102,10 +105,13 @@ def profile_switch_via_menu(app, a):
 @test
 def profile_switch_rapid(app, a):
     app.open("/")
-    for name in (a.profiles * 3)[:5]:
+    seq = (a.profiles * 3)[:5]
+    for name in seq:
         app.switch_profile(name)
     time.sleep(4)
     app.assert_clean("after 5 fast profile switches")
+    got = app.active_profile() or ""
+    check(seq[-1] in [l.strip() for l in got.splitlines()], f"ended on {got!r}, expected {seq[-1]!r}")
 
 @test
 def profile_deep_link(app, a):
@@ -123,6 +129,7 @@ def unknown_profile_deep_link_is_harmless(app, a):
 @test
 def theme_switching(app, a):
     app.page.goto(a.base + "/#/settings?page=main")
+    app.page.get_by_role("button", name="Expand: Appearance").wait_for(timeout=45000)
     app.page.get_by_role("button", name="Expand: Appearance").click()
     app.page.get_by_role("button", name="Theme", exact=True).click()
     for mode in ("Light", "Dark", "System", "Dark"):
@@ -170,6 +177,8 @@ def expired_signin_reloads_to_sign_in(app, a):
     time.sleep(4)
     check(app.page.evaluate("window.__suiteMark") == 2, "reloaded again within a minute (reload loop)")
     check(not re.search("requires a ws://", app.text()), "old ws:// error shown")
+    check(app.page.locator("#hermes-web-signin").is_visible(), "no 'sign-in expired' message shown on second expiry")
+    app.page.evaluate("document.getElementById('hermes-web-signin')?.remove()")
     app.page.unroute("**/api/auth/ws-ticket"); app.page.unroute("**/api/status")
 
 @test

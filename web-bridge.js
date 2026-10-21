@@ -27,6 +27,28 @@
       return probe.type === 'opaqueredirect'
     } catch { return true }
   }
+  // Sign-in is gone but we already reloaded in the last minute: show a plain
+  // message with a button instead of letting the app dial an empty URL
+  // ("connect() requires a ws:// URL"). The pending ticket request never
+  // settles, so the app sits quietly behind the banner until the user acts.
+  function showSignInBanner() {
+    if (typeof document === 'undefined' || document.getElementById('hermes-web-signin')) return
+    const box = document.createElement('div')
+    box.id = 'hermes-web-signin'
+    box.setAttribute('role', 'alert')
+    box.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;' +
+      'background:#1f2937;color:#fff;padding:10px 14px;border-radius:8px;font:14px system-ui,sans-serif;' +
+      'box-shadow:0 4px 16px rgba(0,0,0,.3);display:flex;gap:12px;align-items:center'
+    box.textContent = 'Your sign-in has expired.'
+    const btn = document.createElement('button')
+    btn.textContent = 'Sign in again'
+    btn.style.cssText = 'background:#fff;color:#111;border:0;border-radius:6px;padding:4px 10px;cursor:pointer'
+    btn.onclick = () => { sessionStorage.removeItem(REAUTH_KEY); location.reload() }
+    box.appendChild(btn)
+    ;(document.body || document.documentElement).appendChild(box)
+  }
+  const SIGNED_OUT = () => { showSignInBanner(); return new Promise(() => {}) }
+
   function reauthAtEdge() {
     const last = Number(sessionStorage.getItem(REAUTH_KEY) || 0)
     if (redirecting || Date.now() - last < 60000) return false
@@ -41,7 +63,10 @@
     try {
       res = await fetch('/api/auth/ws-ticket', { method: 'POST', credentials: 'same-origin' })
     } catch (err) {
-      if (await edgeSignInExpired() && reauthAtEdge()) throw new Error('sign-in expired: reloading to sign in again')
+      if (await edgeSignInExpired()) {
+        if (reauthAtEdge()) throw new Error('sign-in expired: reloading to sign in again')
+        return SIGNED_OUT()
+      }
       throw err
     }
     if (res.status === 401) { toLogin(); throw new Error('401: login required') }
@@ -49,7 +74,7 @@
     const isJson = (res.headers.get('content-type') || '').includes('application/json')
     if (res.redirected || !isJson) {
       if (reauthAtEdge()) throw new Error('sign-in expired: reloading to sign in again')
-      throw new Error('sign-in expired: reload the page to sign in again')
+      return SIGNED_OUT()
     }
     return (await res.json()).ticket
   }

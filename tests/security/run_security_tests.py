@@ -70,9 +70,9 @@ def anonymous(a):
                         ("terminal no ticket", "/api/pty"), ("preview relay no cookie", "/preview-ws"),
                         ("web-terminal ws", "/api/plugins/web-terminal/ws")]:
         code = raw_ws_upgrade(b, path)
-        check(f"websocket {label} is refused", code != 101 and code != 0, f"got {code or 'no answer'}")
+        check(f"websocket {label} is refused (401/403)", code in (401, 403), f"got {code or 'no answer'}")
     code = raw_ws_upgrade(b, "/api/ws?ticket=forged", "Origin: https://evil.example\r\n")
-    check("websocket from a foreign site with forged pass is refused", code not in (101, 0), f"got {code}")
+    check("websocket from a foreign site with forged pass is refused (401/403)", code in (401, 403), f"got {code}")
     # 4. Path tricks can't read server files.
     for path in ["/../../../../etc/passwd", "/%2e%2e/%2e%2e/%2e%2e/etc/passwd", "/..%2f..%2f..%2fetc%2fpasswd",
                  "/static/..%252f..%252fetc/passwd", "/web-bridge.js/../../../etc/passwd", "//etc/passwd",
@@ -99,7 +99,7 @@ def anonymous(a):
     # 7. Oversized uploads are cut off.
     big = b"x" * (17 * 1024 * 1024)
     code, _, _ = http(b, "/api/upload", "POST", big, {"Content-Type": "application/octet-stream"}, timeout=60)
-    check("17 MB upload is rejected before reaching Hermes", code in (413, 0, 401), f"got {code}")
+    check("17 MB upload is rejected by the size limit (413)", code == 413, f"got {code or 'connection reset'}")
     # 8. Login page cannot be used to bounce users to another site.
     for nxt in ["https://evil.example", "//evil.example", "/\\evil.example", "javascript:alert(1)"]:
         code, h, body = http(b, "/login?next=" + urllib.parse.quote(nxt, safe=""))
@@ -118,7 +118,7 @@ def container(a):
     try:
         info = json.loads(subprocess.check_output(["docker", "inspect", "hermes-desktop-web"], text=True))[0]
     except Exception as e:
-        record("container inspect", "SKIP", str(e)[:100]); return
+        record("container inspect", "FAIL", "could not inspect container: " + str(e)[:100]); return
     hc = info["HostConfig"]
     check("container filesystem is read-only", hc.get("ReadonlyRootfs") is True)
     check("container drops all Linux capabilities", "ALL" in (hc.get("CapDrop") or []), str(hc.get("CapDrop")))
@@ -141,7 +141,7 @@ def container(a):
         if re.search(r"(0\.0\.0\.0|\*):9119\s", ss):
             record("Hermes dashboard (:9119) listens on all interfaces", "WARN", "reachable from the local network unless a firewall blocks it")
     except Exception as e:
-        record("listening ports", "SKIP", str(e)[:80])
+        record("listening ports", "FAIL", "could not list ports: " + str(e)[:80])
 
 def signed_in(a):
     from playwright.sync_api import sync_playwright
