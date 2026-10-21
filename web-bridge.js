@@ -15,10 +15,42 @@
 
   let redirecting = false
 
+  // An expired edge sign-in (e.g. Cloudflare Access) answers with a redirect
+  // to another origin: fetch() then fails as a bare TypeError, or follows to
+  // an HTML page. The app swallows mint errors and dials an empty URL, which
+  // surfaces as a meaningless "connect() requires a ws:// URL" toast. Detect
+  // that case and reload once so the edge can show its sign-in page.
+  const REAUTH_KEY = 'hermes.web.reauthAt'
+  async function edgeSignInExpired() {
+    try {
+      const probe = await fetch('/api/status', { credentials: 'same-origin', redirect: 'manual', cache: 'no-store' })
+      return probe.type === 'opaqueredirect'
+    } catch { return true }
+  }
+  function reauthAtEdge() {
+    const last = Number(sessionStorage.getItem(REAUTH_KEY) || 0)
+    if (redirecting || Date.now() - last < 60000) return false
+    redirecting = true
+    sessionStorage.setItem(REAUTH_KEY, String(Date.now()))
+    location.reload()
+    return true
+  }
+
   async function mintTicket() {
-    const res = await fetch('/api/auth/ws-ticket', { method: 'POST', credentials: 'same-origin' })
+    let res
+    try {
+      res = await fetch('/api/auth/ws-ticket', { method: 'POST', credentials: 'same-origin' })
+    } catch (err) {
+      if (await edgeSignInExpired() && reauthAtEdge()) throw new Error('sign-in expired: reloading to sign in again')
+      throw err
+    }
     if (res.status === 401) { toLogin(); throw new Error('401: login required') }
     if (!res.ok) throw new Error(`${res.status}: ws-ticket mint failed`)
+    const isJson = (res.headers.get('content-type') || '').includes('application/json')
+    if (res.redirected || !isJson) {
+      if (reauthAtEdge()) throw new Error('sign-in expired: reloading to sign in again')
+      throw new Error('sign-in expired: reload the page to sign in again')
+    }
     return (await res.json()).ticket
   }
 
