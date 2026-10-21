@@ -173,7 +173,7 @@ def expired_signin_reloads_to_sign_in(app, a):
     check(app.page.evaluate("window.__suiteMark") is None, "page did not reload")
     # second expiry right after: guard must stop a reload loop
     app.page.evaluate("window.__suiteMark = 2")
-    app.page.evaluate("window.hermesDesktop.getGatewayWsUrl().catch(()=>{})")
+    app.page.evaluate("void window.hermesDesktop.getGatewayWsUrl().catch(()=>{})")
     time.sleep(4)
     check(app.page.evaluate("window.__suiteMark") == 2, "reloaded again within a minute (reload loop)")
     check(not re.search("requires a ws://", app.text()), "old ws:// error shown")
