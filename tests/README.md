@@ -11,3 +11,5 @@ Deploy rule: unit tests green → commit + push → build → deploy → `live-s
 
 Not covered (needs a real signed-in browser): actual Cloudflare Access expiry,
 profile switching end-to-end, themes, attachments, browser pane.
+
+Manual browser checks: see `tests/MANUAL-CHECKLIST.md`.
