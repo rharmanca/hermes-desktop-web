@@ -70,6 +70,28 @@ def url_is_private(url):
     return not ip.is_global
 
 
+async def url_blocked(url):
+    """url_is_private plus DNS: a public-looking name (e.g. 127.0.0.1.nip.io) that resolves
+    to a loopback/LAN address is blocked too. Unresolvable names are allowed through
+    (Chromium will fail them itself)."""
+    if url_is_private(url):
+        return True
+    u = urllib.parse.urlsplit(url)
+    if u.scheme not in ("http", "https"):
+        return False
+    host = (u.hostname or "").strip("[]").lower()
+    try:
+        ipaddress.ip_address(host)
+        return False  # literal IP already judged above
+    except ValueError:
+        pass
+    try:
+        infos = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(host, None), 5)
+    except Exception:
+        return False
+    return any(not ipaddress.ip_address(i[4][0].split("%")[0]).is_global for i in infos)
+
+
 KEY_VK = {"Enter": 13, "Return": 13, "Tab": 9, "Backspace": 8, "Escape": 27, "Delete": 46, "Insert": 45,
           "ArrowLeft": 37, "ArrowUp": 38, "ArrowRight": 39, "ArrowDown": 40, "Home": 36, "End": 35,
           "PageUp": 33, "PageDown": 34, " ": 32, "Space": 32, "Shift": 16, "Control": 17, "Alt": 18, "Meta": 91}
@@ -271,7 +293,7 @@ class Pane:
     async def _event(self, method, p):
         if method == "Fetch.requestPaused":
             rid = p["requestId"]
-            if url_is_private(p["request"]["url"]):
+            if await url_blocked(p["request"]["url"]):
                 await self.call("Fetch.failRequest", requestId=rid, errorReason="AccessDenied")
             else:
                 await self.call("Fetch.continueRequest", requestId=rid)
@@ -345,7 +367,7 @@ class Pane:
             url = str(m.get("url", "")).strip()
             if not url.lower().startswith(("http://", "https://", "about:blank")):
                 raise ValueError("only http(s) URLs may be previewed")
-            if url != "about:blank" and url_is_private(url):
+            if url != "about:blank" and await url_blocked(url):
                 raise ValueError("private/internal addresses cannot be previewed")
             await self.call("Page.navigate", url=url)
         elif op == "resize":

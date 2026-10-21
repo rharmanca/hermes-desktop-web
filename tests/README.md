@@ -13,3 +13,23 @@ Not covered (needs a real signed-in browser): actual Cloudflare Access expiry,
 profile switching end-to-end, themes, attachments, browser pane.
 
 Manual browser checks: see `tests/MANUAL-CHECKLIST.md`.
+
+## One command
+
+```bash
+tests/run-all.sh                    # offline layers (what GitHub runs on every push)
+tests/run-all.sh --live             # + read-only smoke and security checks on the running site
+tests/run-all.sh --live --browser   # + real-browser suite (signed-in Chromium on :9222)
+```
+
+| Layer | File | Needs |
+|---|---|---|
+| Web bridge unit tests | `tests/web-bridge.test.mjs` | Node 22 |
+| Browser-pane address filter | `tests/relay/test_relay_filters.py` | Python 3 |
+| Nginx routing, blocking, headers, upload limit | `tests/nginx/run_nginx_tests.sh` | Docker (throwaway containers, port 18099) |
+| Web-terminal plugin (stays disabled in prod) | `gateway-plugin/web-terminal/tests` | hermes-agent venv |
+| Live smoke | `tests/live-smoke.sh` | running site |
+| Live security (auth, WS, traversal, container hardening) | `tests/security/run_security_tests.py` | running site + docker |
+| Real browser (profiles, themes, attach, expiry) | `tests/browser/run_browser_tests.py` | signed-in Chromium on :9222 |
+
+GitHub Actions: `.github/workflows/tests.yml` runs the offline layers on pushes to `robweb` / `wip/**` and on PRs.

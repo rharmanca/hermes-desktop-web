@@ -230,3 +230,11 @@ test('saveImageBuffer returns a readable token path', async () => {
   const p = await bridge.saveImageBuffer(new Uint8Array([1, 2]), 'png')
   assert.match(p, /^\/browser-upload\/\d+\/image\.png$/)
 })
+
+test('zoom API resolves { percent } (renderer destructures it at startup)', async () => {
+  const { bridge } = load({ routes: ticketOk })
+  const { percent } = await bridge.zoom.get()
+  assert.equal(percent, 100)
+  assert.equal(bridge.zoom.factor(), 1)
+  assert.equal(typeof bridge.zoom.onChanged(() => {}), 'function')
+})

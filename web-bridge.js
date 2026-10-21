@@ -397,6 +397,15 @@
         return { applied: true, current: entry }
       }
     },
+    // The browser owns page zoom (Ctrl +/-), so report a fixed 100%. Must be
+    // explicit: the renderer destructures `{ percent }` from get() at startup,
+    // and the universal fallback resolves null -> uncaught TypeError.
+    zoom: {
+      get: async () => ({ level: 0, percent: 100 }),
+      factor: () => 1,
+      setPercent: noop,
+      onChanged: subscribe
+    },
     claimStartupLatency: async () => false,
     getBootProgress: async () => null,
     requestMicrophoneAccess: async () => {

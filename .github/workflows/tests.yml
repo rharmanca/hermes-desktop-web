@@ -1,0 +1,34 @@
+name: robweb tests
+# Offline layers only. Live/browser/security layers need the running server and are run there
+# with: tests/run-all.sh --live --browser
+on:
+  push:
+    branches: [robweb, "wip/**"]
+  pull_request:
+    branches: [robweb]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Syntax
+        run: |
+          node --check web-bridge.js
+          node --check deploy/robweb/web-preview.js
+          python -m py_compile deploy/robweb/preview-relay/relay.py
+      - name: Web bridge unit tests
+        run: node --test tests/*.test.mjs
+      - name: Browser-pane relay filter tests
+        run: python tests/relay/test_relay_filters.py
+      - name: Nginx config routing + header tests (throwaway containers)
+        run: bash tests/nginx/run_nginx_tests.sh
+      - name: Shell scripts lint
+        run: shellcheck -S error tests/*.sh tests/nginx/*.sh
