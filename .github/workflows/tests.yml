@@ -36,10 +36,13 @@ jobs:
           PREVIEW_CHROMIUM="$(command -v google-chrome || command -v chromium)" python tests/relay/run_relay_e2e.py
       - name: Nginx config routing + header tests (throwaway containers)
         run: bash tests/nginx/run_nginx_tests.sh
+      - uses: actions/setup-python@v5
+        id: py314
+        with: { python-version: "3.14" }   # same Python as the Hermes install on robweb
       - name: Web-terminal plugin tests (needs Hermes source; plugin stays disabled in production)
         run: |
           git clone -q --depth 1 --branch "${HERMES_REF:-v0.22.2}" https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
-          python -m venv "$RUNNER_TEMP/hv"
+          "${{ steps.py314.outputs.python-path }}" -m venv "$RUNNER_TEMP/hv"
           "$RUNNER_TEMP/hv/bin/pip" install -q -e "$RUNNER_TEMP/hermes-agent[web]" pytest httpx
           "$RUNNER_TEMP/hv/bin/python" -c "import ptyprocess, fastapi, yaml"
           HERMES_HOME="$RUNNER_TEMP/hh" "$RUNNER_TEMP/hv/bin/python" -m pytest gateway-plugin/web-terminal/tests -q -o addopts="" -p no:cacheprovider
