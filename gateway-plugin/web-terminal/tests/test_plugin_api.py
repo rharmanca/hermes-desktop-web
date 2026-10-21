@@ -918,7 +918,10 @@ def test_input_budget_is_a_sliding_window(plugin):
     assert b.add(9.5, 1) is True  # still inside the window
     b = plugin._InputBudget(10.0, 1000)
     assert b.add(0.0, 1000) is False
-    assert b.add(10.0, 1000) is False  # the oldest bucket has slid out: a fresh window
+    assert b.add(9.999, 1) is True  # every byte counts for the full window, never early
+    b = plugin._InputBudget(10.0, 1000)
+    assert b.add(0.0, 1000) is False
+    assert b.add(10.05, 1000) is False  # whole 50 ms quantum now window-old: a fresh window
     b = plugin._InputBudget(10.0, 1000)
     for t in range(0, 10):  # 100 B/s sustained is fine ...
         assert b.add(float(t), 100) is False

@@ -33,7 +33,11 @@ Hardening (robweb build):
   The process-internal WS credential never opens a shell, whatever the list says.
 * **Two shells at a time, counting shells still being torn down.** A slot is held
   until the PTY's close sequence has finished, so a reconnect loop cannot stack
-  live-or-exiting shells past the cap.
+  live-or-exiting shells past the cap. A close that raises is *not* proof the shell is
+  gone: that slot stays quarantined (held) until the dashboard restarts.
+* **Admission rate.** At most ``MAX_ADMISSIONS_PER_WINDOW`` shells are started per
+  rolling ``ADMISSION_WINDOW_S`` (process-wide), so a connect/close loop cannot churn
+  shells even when each one is reaped at once.
 * **20 minutes without keyboard input** closes a shell. Resize controls are layout,
   not typing — every ``ESC[RESIZE:..]`` in a frame is consumed and none resets the
   clock. The idle watchdog runs on its own task, so a browser that stops reading
@@ -41,8 +45,9 @@ Hardening (robweb build):
 * **Bounded input.** Dial-time size and every resize are clamped to the core resize
   ceiling (``PtyBridge.spawn`` forwards raw values to ptyprocess, where anything
   above 65535 raises inside the *forked child*); one input frame is at most 64 KiB;
-  at most 1 MiB of input per sliding 10 s window (10 one-second buckets, so the
-  effective window is 9–10 s). Residual: uvicorn's ``ws_max_size`` is the
+  at most 1 MiB of input per rolling 10 s window. Every byte counts for at least the
+  full 10 s (bounded accounting in 50 ms quanta, rounded *up*, so the window is
+  10–10.05 s, never shorter). Residual: uvicorn's ``ws_max_size`` is the
   dashboard-wide 384 MiB attachment ceiling and a message is reassembled before this
   handler sees it; PTY output has no quota (a permitted command may print a lot).
 * **Environment:** the dashboard environment **minus Hermes-managed secrets** (the
@@ -55,6 +60,7 @@ Hardening (robweb build):
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import datetime as _dt
 import importlib
@@ -92,8 +98,11 @@ MAX_ROWS = 1000
 # attachment ceiling (384 MiB) and cannot be lowered per route, so bound it here.
 MAX_INPUT_FRAME_BYTES = 64 * 1024  # ponytail: one frame; a paste larger than this closes the shell
 INPUT_WINDOW_S = 10.0
-INPUT_WINDOW_BUCKETS = 10  # sliding window of INPUT_WINDOW_S in INPUT_WINDOW_BUCKETS buckets
+INPUT_QUANTUM_S = 0.05  # accounting granularity; a byte is counted until its whole quantum is window-old
 MAX_INPUT_BYTES_PER_WINDOW = 1024 * 1024
+# Process-wide shell-start rate (in addition to the concurrency cap): reconnect churn bound.
+MAX_ADMISSIONS_PER_WINDOW = 12
+ADMISSION_WINDOW_S = 60.0
 _READ_TIMEOUT_S = 0.2
 _IDLE_BACKOFF_S = 0.05  # quiet terminal: yield instead of re-polling at once (mirrors core)
 _WATCHDOG_TICK_S = 1.0  # idle watchdog cadence (shortened automatically for a short IDLE_TIMEOUT_S)
@@ -169,8 +178,13 @@ def _ws_deny_reason(ws: WebSocket, core: Any) -> tuple[Optional[int], str]:
     if not (isinstance(result, tuple) and len(result) == 2):
         return CLOSE_AUTH, "auth gate error: unexpected result shape"
     auth_reason, cred = result
+    # Contract: tuple[Optional[str], str]. Validate member types before using or logging them.
+    if auth_reason is not None and not isinstance(auth_reason, str):
+        return CLOSE_AUTH, "auth gate error: unexpected result shape"
     if auth_reason is not None:
         return CLOSE_AUTH, f"auth: {auth_reason}"
+    if not isinstance(cred, str) or not cred.strip():
+        return CLOSE_AUTH, "auth gate error: unexpected result shape"
     try:
         allowed = core._ws_request_is_allowed(ws)
     except Exception as exc:
@@ -180,7 +194,7 @@ def _ws_deny_reason(ws: WebSocket, core: Any) -> tuple[Optional[int], str]:
         return CLOSE_ORIGIN, "origin gate error: unexpected result shape"
     if allowed is not True:  # exactly True: a tuple, an int or None is contract drift, not "allowed"
         return CLOSE_ORIGIN, "host/origin/peer not allowed"
-    return None, str(cred)
+    return None, cred
 
 
 # --- Policy (launch-home config, readable or nothing) --------------------------
@@ -344,26 +358,54 @@ def _dimension(raw: Any, default: int, maximum: int) -> int:
 
 
 class _InputBudget:
-    """Bounded sliding-window byte budget: ``buckets`` equal buckets over ``window_s``.
-    A burst straddling a bucket boundary is still counted (the window slides); memory is
-    O(buckets) whatever the frame size. Effective window: (buckets-1)/buckets .. 1 x window_s."""
+    """True rolling-window byte budget with bounded memory.
 
-    def __init__(self, window_s: float, limit: int, buckets: int = INPUT_WINDOW_BUCKETS) -> None:
-        self.width = window_s / buckets
+    Bytes are accumulated per ``quantum_s`` quantum. A quantum is dropped only once its
+    END is a full ``window_s`` old, so every byte is counted for at least ``window_s``
+    (at most ``window_s + quantum_s``) — the window never expires early. Memory is
+    O(window_s / quantum_s) entries whatever the frame count or size."""
+
+    def __init__(self, window_s: float, limit: int, quantum_s: float = INPUT_QUANTUM_S) -> None:
+        self.window = window_s
+        self.quantum = quantum_s
         self.limit = limit
-        self.epochs: list[Optional[int]] = [None] * buckets
-        self.bytes: list[int] = [0] * buckets
+        self.entries: collections.deque[list[int]] = collections.deque()  # [quantum index, bytes]
+        self.total = 0
 
     def add(self, now: float, nbytes: int) -> bool:
         """Record ``nbytes`` at ``now``; True when the window total now exceeds the limit."""
-        idx = int(now // self.width)
-        slot = idx % len(self.bytes)
-        if self.epochs[slot] != idx:
-            self.epochs[slot], self.bytes[slot] = idx, 0
-        self.bytes[slot] += nbytes
-        oldest = idx - len(self.bytes) + 1
-        total = sum(b for e, b in zip(self.epochs, self.bytes) if e is not None and e >= oldest)
-        return total > self.limit
+        q = int(now // self.quantum)
+        while self.entries and (self.entries[0][0] + 1) * self.quantum + self.window <= now:
+            self.total -= self.entries.popleft()[1]
+        if self.entries and self.entries[-1][0] >= q:
+            self.entries[-1][1] += nbytes  # same (or clock-skewed earlier) quantum: merge
+        else:
+            self.entries.append([q, nbytes])
+        self.total += nbytes
+        return self.total > self.limit
+
+
+class _AdmissionRate:
+    """At most ``limit`` admissions per rolling ``window_s``; O(limit) memory."""
+
+    def __init__(self, window_s: float, limit: int) -> None:
+        self.window = window_s
+        self.limit = limit
+        self.stamps: collections.deque[float] = collections.deque()
+        self.lock = threading.Lock()
+
+    def take(self, now: float) -> bool:
+        """Consume one admission at ``now``; False when the window is full."""
+        with self.lock:
+            while self.stamps and self.stamps[0] + self.window <= now:
+                self.stamps.popleft()
+            if len(self.stamps) >= self.limit:
+                return False
+            self.stamps.append(now)
+            return True
+
+
+_ADMISSIONS = _AdmissionRate(ADMISSION_WINDOW_S, MAX_ADMISSIONS_PER_WINDOW)
 
 
 def _reserve_slot(peer: str) -> tuple[Optional[int], Optional[dict[str, Any]]]:
@@ -382,6 +424,11 @@ def _reserve_slot(peer: str) -> tuple[Optional[int], Optional[dict[str, Any]]]:
 def _active_count() -> int:
     with _ACTIVE_LOCK:
         return len(_ACTIVE)
+
+
+def _quarantined_count() -> int:
+    with _ACTIVE_LOCK:
+        return sum(1 for s in _ACTIVE.values() if s.get("quarantined"))
 
 
 def _release_slot(key: int) -> None:
@@ -405,11 +452,19 @@ def _reap(slot: dict[str, Any], bridge: Any) -> threading.Thread:
             return thread
 
         def _close() -> None:
+            # Release ONLY after close() returned normally. If it raised, the shell may still
+            # be alive (the core marks itself closed before finishing its signal cadence, so
+            # is_alive() is no proof either): keep the slot held -> fail closed on capacity.
             try:
-                with contextlib.suppress(Exception):
-                    bridge.close()
-            finally:
-                _release_slot(slot["key"])
+                bridge.close()
+            except Exception as exc:  # health: allow BLE001 -- quarantine, never free capacity
+                slot["quarantined"] = True
+                _log.error("web-terminal reap failed pid=%s: %s; slot quarantined until restart",
+                           slot.get("pid"), type(exc).__name__)
+                _audit("error", reason=f"reap: {type(exc).__name__}", pid=slot.get("pid"),
+                       quarantined=True)
+                return
+            _release_slot(slot["key"])
 
         thread = threading.Thread(target=_close, name="web-terminal-reap", daemon=True)
         slot["reaper"] = thread
@@ -445,6 +500,7 @@ async def health(request: Request):
         "policy_readable": _policy_config() is not None,
         "allowed_users_configured": bool(_allowed_users()),
         "active": _active_count(),
+        "quarantined": _quarantined_count(),
         "limit": MAX_TERMINALS,
         "idle_timeout_seconds": IDLE_TIMEOUT_S,
         "version": PLUGIN_VERSION,
@@ -529,6 +585,17 @@ async def terminal_ws(ws: WebSocket) -> None:
         await _fail(ws, f"terminal limit reached ({MAX_TERMINALS} open shells)", code=CLOSE_BUSY)
         return
 
+    # 8. Admission rate — bounds connect/close churn even when every shell is reaped at once.
+    if not _ADMISSIONS.take(time.monotonic()):
+        _release_slot(key)
+        _audit("deny", reason="admission_rate", peer=peer, limit=MAX_ADMISSIONS_PER_WINDOW,
+               window_s=ADMISSION_WINDOW_S, **ident)
+        _log.warning("web-terminal refused: admission rate %d/%ss reached peer=%s",
+                     MAX_ADMISSIONS_PER_WINDOW, ADMISSION_WINDOW_S, peer)
+        await ws.accept()
+        await _fail(ws, "too many terminals opened recently; try again shortly", code=CLOSE_BUSY)
+        return
+
     bridge = None
     tasks: list[asyncio.Task] = []
     loop = asyncio.get_running_loop()
@@ -573,7 +640,12 @@ async def terminal_ws(ws: WebSocket) -> None:
         async def pump_pty_to_ws() -> None:
             while True:
                 # bridge.read blocks up to the poll timeout in a worker thread; None = EOF.
-                chunk = await asyncio.to_thread(bridge.read, _READ_TIMEOUT_S)
+                try:
+                    chunk = await asyncio.to_thread(bridge.read, _READ_TIMEOUT_S)
+                except Exception as exc:  # health: allow BLE001 -- PTY I/O error: shared bounded teardown
+                    _log.warning("web-terminal PTY read failed: %s", type(exc).__name__)
+                    await _end("read_error", CLOSE_ERROR, "terminal output failed")
+                    return
                 if chunk is None:
                     await _end("shell_exited", CLOSE_EXITED, "shell exited")
                     return
@@ -608,6 +680,7 @@ async def terminal_ws(ws: WebSocket) -> None:
 
         while True:
             recv = asyncio.create_task(ws.receive())
+            tasks.append(recv)  # owned: cancelled + awaited in finally, even if this handler is cancelled
             done, _ = await asyncio.wait({recv, stop}, return_when=asyncio.FIRST_COMPLETED)
             if recv not in done:
                 # The session was ended by the pump or the watchdog. Do not wait for the
@@ -617,6 +690,7 @@ async def terminal_ws(ws: WebSocket) -> None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await recv
                 break
+            tasks.remove(recv)
             try:
                 msg = recv.result()
             except Exception:  # health: allow BLE001 -- receive() after close, or a transport error: the session is over
