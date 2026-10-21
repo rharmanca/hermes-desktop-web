@@ -84,8 +84,12 @@ async def main():
         left = subprocess.run(["pgrep", "-f", f"user-data-dir={tmp}"], capture_output=True, text=True).stdout.split()
         check("no Chromium left running after shutdown", not left, f"{len(left)} processes")
         check("relay logged egress blocks", "egress blocked" in log, "no 'egress blocked' lines in relay log")
+        if any(not r[1] for r in res): print("---- relay log (tail)\n" + "\n".join(log.splitlines()[-25:]))
 
-asyncio.run(main())
+try:
+    asyncio.run(main())
+except Exception as exc:
+    check("test ran to completion", False, f"{type(exc).__name__}: {exc}")
 for n, ok, note in res: print(("PASS  " if ok else "FAIL  ") + n + (f"  — {note}" if note else ""))
 f = sum(not r[1] for r in res)
 print(f"---- {len(res) - f} passed, {f} failed")

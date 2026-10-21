@@ -30,6 +30,9 @@ jobs:
       - name: Browser-pane relay end-to-end (real Chrome tries to reach private services)
         run: |
           python -m pip install -q websockets
+          # Ubuntu 24 runners block Chrome's sandbox; allow it rather than running with --no-sandbox,
+          # so CI tests the same sandboxed browser production uses.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           PREVIEW_CHROMIUM="$(command -v google-chrome || command -v chromium)" python tests/relay/run_relay_e2e.py
       - name: Nginx config routing + header tests (throwaway containers)
         run: bash tests/nginx/run_nginx_tests.sh
