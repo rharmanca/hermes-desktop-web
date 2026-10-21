@@ -436,14 +436,44 @@ def _release_slot(key: int) -> None:
         _ACTIVE.pop(key, None)
 
 
+def _cleanup_unconfirmed(bridge: Any) -> Optional[str]:
+    """None only if the bridge's own child is positively confirmed gone; otherwise a reason.
+
+    Relies on the private core contract ``PtyBridge._proc`` (a ptyprocess handle whose
+    ``isalive()`` reaps via waitpid, independent of the bridge's early ``_closed`` flag) and
+    ``_pgid``. Missing or failing contract -> unconfirmed (fail closed). When the shell leads
+    its own process group, the group must also be empty. A shared-group child's descendants
+    cannot be checked without a group signal, so only the leader is confirmed there."""
+    proc = getattr(bridge, "_proc", None)
+    isalive = getattr(proc, "isalive", None)
+    if not callable(isalive):
+        return "cleanup contract missing"
+    try:
+        if isalive() is not False:
+            return "child still alive"
+    except Exception as exc:  # health: allow BLE001 -- unknown status is not proof
+        return f"child status unknown: {type(exc).__name__}"
+    pgid = getattr(bridge, "_pgid", None)
+    pid = getattr(proc, "pid", None)
+    if isinstance(pgid, int) and not isinstance(pgid, bool) and pgid > 1 and pgid == pid:
+        try:
+            os.killpg(pgid, 0)  # windows-footgun: ok — POSIX-only, as the core bridge
+        except ProcessLookupError:
+            return None
+        except Exception as exc:  # health: allow BLE001 -- EPERM etc.: group may exist
+            return f"process group status unknown: {type(exc).__name__}"
+        return "process group still populated"
+    return None
+
+
 def _reap(slot: dict[str, Any], bridge: Any) -> threading.Thread:
     """Close the PTY bridge off the event loop on a plain thread — never an executor
     future — and release the slot only AFTER the close sequence has finished.
 
     ``bridge.close()`` blocks (SIGHUP → SIGTERM → SIGKILL cadence), so it must not run on
     the loop; but a ``run_in_executor``/``to_thread`` future is cancelled along with the
-    awaiting task at shutdown and a not-yet-started work item is silently dropped — the
-    shell would outlive the socket. A daemon thread cannot be cancelled. Single-flight per
+    awaiting task at shutdown and a not-yet-started work item is silently dropped. The slot
+    is released only after ``_cleanup_unconfirmed`` positively confirms the child is gone. A daemon thread cannot be cancelled. Single-flight per
     slot: ``PtyBridge.close`` returns at once for a second concurrent caller, so a second
     reaper must not be the one that releases the slot while the first is still signalling."""
     with _ACTIVE_LOCK:
@@ -451,18 +481,24 @@ def _reap(slot: dict[str, Any], bridge: Any) -> threading.Thread:
         if thread is not None:
             return thread
 
+        def _quarantine(reason: str) -> None:
+            slot["quarantined"] = True
+            _log.error("web-terminal reap unconfirmed pid=%s: %s; slot quarantined until restart",
+                       slot.get("pid"), reason)
+            _audit("error", reason=f"reap: {reason}", pid=slot.get("pid"), quarantined=True)
+
         def _close() -> None:
-            # Release ONLY after close() returned normally. If it raised, the shell may still
-            # be alive (the core marks itself closed before finishing its signal cadence, so
-            # is_alive() is no proof either): keep the slot held -> fail closed on capacity.
+            # Release ONLY on positive proof the owned child is gone. A normal return from
+            # close() is not proof: the core sets its closed flag first and suppresses a failed
+            # final terminate, so bridge.is_alive() is no proof either. Unknown -> hold the slot.
             try:
                 bridge.close()
             except Exception as exc:  # health: allow BLE001 -- quarantine, never free capacity
-                slot["quarantined"] = True
-                _log.error("web-terminal reap failed pid=%s: %s; slot quarantined until restart",
-                           slot.get("pid"), type(exc).__name__)
-                _audit("error", reason=f"reap: {type(exc).__name__}", pid=slot.get("pid"),
-                       quarantined=True)
+                _quarantine(type(exc).__name__)
+                return
+            reason = _cleanup_unconfirmed(bridge)
+            if reason is not None:
+                _quarantine(reason)
                 return
             _release_slot(slot["key"])
 

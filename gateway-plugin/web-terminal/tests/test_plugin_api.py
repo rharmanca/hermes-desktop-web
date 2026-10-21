@@ -90,6 +90,13 @@ class FakeBridge:
     def resize(self, cols: int, rows: int) -> None:
         self.size = (cols, rows)
 
+    _pgid = None
+
+    @property
+    def _proc(self):
+        # Minimal stand-in for the core's private ptyprocess handle (cleanup confirmation).
+        return types.SimpleNamespace(pid=self.pid, isalive=lambda: not self.closed)
+
     def is_alive(self) -> bool:
         return not self.closed
 
