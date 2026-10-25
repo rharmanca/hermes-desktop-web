@@ -46,6 +46,23 @@ for p in ["/web-bridge.js", "/web-preview.js"]:
 check("/index.html revalidated", "no-cache" in get("/index.html")[1].get("cache-control", ""))
 check("server version hidden", not re.search(r"\d", h.get("server", "")), h.get("server"))
 
+# Performance: hashed assets cached long-term, static text compressed
+c, hh, b = get("/assets/app-Ab12Cd.js")
+check("hashed asset served", c == 200 and b.startswith(b"console.log"), f"{c}")
+check("hashed asset cached 1 year + immutable", "max-age=31536000" in hh.get("cache-control", "") and "immutable" in hh.get("cache-control", ""), hh.get("cache-control"))
+for k, v in [("x-frame-options", "DENY"), ("x-content-type-options", "nosniff"), ("referrer-policy", "same-origin")]:
+    check(f"/assets/: header {k}", hh.get(k) == v, f"{hh.get(k)!r}")
+c, hh, _ = get("/assets/app-Ab12Cd.js", headers={"Accept-Encoding": "gzip"})
+check("asset gzip-compressed when browser asks", hh.get("content-encoding") == "gzip", hh.get("content-encoding"))
+check("Vary: Accept-Encoding sent", "accept-encoding" in hh.get("vary", "").lower(), hh.get("vary"))
+check("asset uncompressed when browser doesn't ask", get("/assets/app-Ab12Cd.js")[1].get("content-encoding") is None)
+c, hh, b = get("/assets/missing-XYZ.js")
+check("missing asset is 404, not the app page", c == 404 and b"web-bridge.js" not in b, f"{c}")
+check("/index.html still revalidated (new releases show up)", "no-cache" in get("/index.html")[1].get("cache-control", ""))
+check("web-bridge.js still never cached", "no-store" in get("/web-bridge.js")[1].get("cache-control", ""))
+_, hh, _ = get("/api/sessions", headers={"Accept-Encoding": "gzip"})
+check("API responses not compressed by nginx", hh.get("content-encoding") is None, hh.get("content-encoding"))
+
 # API proxying
 code, _, e = echo("/api/sessions?profile=hermes-admin")
 check("/api/* goes to the Hermes backend", e and e["stub_port"] == 9119 and e["path"] == "/api/sessions?profile=hermes-admin", str(e)[:120])

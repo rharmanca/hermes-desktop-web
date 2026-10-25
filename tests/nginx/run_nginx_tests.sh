@@ -14,6 +14,7 @@ echo "nginx image: $NGINX_IMAGE ($(docker run --rm --entrypoint nginx "$NGINX_IM
 cleanup() { docker rm -f "$ID-nginx" "$ID-stub" >/dev/null 2>&1 || true; docker network rm "$ID" >/dev/null 2>&1 || true; rm -rf "$WWW"; }
 WWW="$(mktemp -d)"; trap cleanup EXIT
 printf '<html><head><script src="./web-bridge.js?v=test"></script></head><body>app</body></html>' > "$WWW/index.html"
+mkdir -p "$WWW/assets"; python3 -c "print('console.log(1);'*500)" > "$WWW/assets/app-Ab12Cd.js"
 cp "$ROOT/web-bridge.js" "$ROOT/deploy/robweb/web-preview.js" "$WWW/"; chmod -R a+rX "$WWW"
 
 docker network create "$ID" >/dev/null
