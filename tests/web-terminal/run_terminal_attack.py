@@ -24,6 +24,8 @@ PY = os.path.join(SRC, ".venv/bin/python")
 HOST = os.environ.get("WT_TEST_HOST", "172.17.0.1")
 CANARY = "OPENROUTER_API_KEY"  # a Hermes-managed secret name: the shell scrub must drop it
 R = []
+# Which gate refuses each case; None = the core dashboard gate (before the plugin, not audited).
+AUD = {"nocred": "auth: no_credential", "junk": "auth: ticket_invalid", "origin": "host/origin/peer not allowed"}
 
 
 def rec(name, ok, detail=""):
@@ -49,9 +51,10 @@ class Env:
         self.ws = f"ws://{HOST}:{self.port}/api/plugins/web-terminal/terminal"
 
     def write_cfg(self, allowed, enabled):
-        with open(self.cfg, "w") as f:
+        with open(self.cfg + ".tmp", "w") as f:  # atomic: the dashboard never reads half a file
             f.write("plugins:\n  enabled: [%s]\n  entries:\n    web-terminal:\n      settings:\n"
                     "        allowed_users: %s\n" % ("web-terminal" if enabled else "", allowed))
+        os.replace(self.cfg + ".tmp", self.cfg)
 
     def start(self):
         env = {"HOME": os.environ.get("HOME", "/tmp"), "PATH": "/usr/local/bin:/usr/bin:/bin",
@@ -82,6 +85,21 @@ class Env:
 
 E = None
 DENY = (4401, 4403, "http401", "http403")
+_seen = [0]
+
+
+def new_audit():
+    """Reasons from audit lines written since the last call (the plugin logs every refusal it makes)."""
+    try: lines = open(os.path.join(E.home, "logs/web-terminal-audit.log")).read().splitlines()
+    except OSError: lines = []
+    out = [json.loads(l).get("reason") for l in lines[_seen[0]:]]; _seen[0] = len(lines); return out
+
+
+def deny(name, r, reason):
+    """Refused AND refused by the intended gate (reason=None: refused before the plugin runs)."""
+    got = new_audit()
+    ok = r in DENY and (got == [] if reason is None else reason in got)
+    rec(name, ok, f"{r} audit={got}")
 
 
 async def login(s, pw=None, user="owner"):
@@ -96,6 +114,7 @@ async def ticket(s):
 
 
 async def dial(q="", origin=None):
+    new_audit()  # attribute audit lines to this dial only
     try:
         ws = await websockets.connect(E.ws + q, origin=origin or E.base, max_size=None, open_timeout=10)
     except websockets.InvalidStatus as e: return None, f"http{e.response.status_code}"
@@ -135,27 +154,27 @@ async def shut(*socks):
 
 
 async def main():
-    _, r = await dial(); rec("no credential refused", r in DENY, r)
-    _, r = await dial("?ticket=junk"); rec("junk ticket refused", r in DENY, r)
-    _, r = await dial("?token=junk"); rec("junk token refused", r in DENY, r)
+    new_audit(); _, r = await dial(); deny("no credential refused", r, AUD["nocred"])
+    _, r = await dial("?ticket=junk"); deny("junk ticket refused", r, AUD["junk"])
+    _, r = await dial("?token=junk"); deny("junk token refused", r, "auth: token_invalid")
     jar = lambda: aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True))
     async with jar() as s:
         rec("wrong password rejected", await login(s, "nope") == 401)
-        _, r = await dial(f"?ticket={await ticket(s)}"); rec("no ticket without login", r in DENY, r)
+        _, r = await dial(f"?ticket={await ticket(s)}"); deny("no ticket without login", r, AUD["junk"])
     async with jar() as s:
         assert await login(s) == 200, "owner login failed"
         async with s.get(E.base + "/api/plugins/web-terminal/health") as h:
             body = await h.json(); rec("health ok after login", h.status == 200 and body.get("contract_ok"), body)
-        _, r = await dial(f"?ticket={await ticket(s)}", origin="https://evil.example"); rec("foreign origin refused", r in DENY, r)
-        _, r = await dial(f"?ticket={await ticket(s)}&profile=default"); rec("?profile= refused", r in DENY, r)
+        _, r = await dial(f"?ticket={await ticket(s)}", origin="https://evil.example"); deny("foreign origin refused", r, AUD["origin"])
+        _, r = await dial(f"?ticket={await ticket(s)}&profile=default"); deny("?profile= refused", r, "profile_param")
 
         t = await ticket(s); ws, r = await dial(f"?ticket={t}"); rec("owner gets a shell", r == "open", r)
         rec("shell round-trip", b"HELLO_42" in await run(ws, "echo HELLO_$((6*7))", "HELLO_42"))
         out = await run(ws, f"echo C=${{{CANARY}:-none}}=E\"N\"D", "=END")
         m = re.findall(rb"C=(\S+?)=END", out)
         rec("dashboard's own secrets not passed to shell", m[-1:] == [b"none"], [x[:7] for x in m])
-        _, r = await dial(f"?ticket={t}"); rec("reused ticket refused", r in DENY, r)
-        ws2, r2 = await dial(f"?ticket={await ticket(s)}"); rec("2nd shell allowed", r2 == "open", r2)
+        _, r = await dial(f"?ticket={t}"); deny("reused ticket refused", r, AUD["junk"])
+        ws2, r2 = await dial(f"?ticket={await ticket(s)}"); rec("2nd shell allowed and usable", r2 == "open" and b"TWO_OK" in await run(ws2, "echo TWO_O\"K\"", "TWO_OK"), r2)
         _, r = await dial(f"?ticket={await ticket(s)}"); rec("3rd shell refused (limit 2)", r == 1013, r)
         await shut(ws, ws2)
 
@@ -184,15 +203,21 @@ async def main():
         rec("abrupt disconnect kills shell", not os.path.exists(f"/proc/{p}"), p)
 
         E.write_cfg('["basic:someone-else"]', True)
-        _, r = await dial(f"?ticket={await ticket(s)}"); rec("logged in but not owner refused", r in DENY, r)
+        _, r = await dial(f"?ticket={await ticket(s)}"); deny("logged in but not owner refused", r, "not_allowed")
         E.write_cfg("[]", True)
-        _, r = await dial(f"?ticket={await ticket(s)}"); rec("empty owner list = nobody", r in DENY, r)
+        _, r = await dial(f"?ticket={await ticket(s)}"); deny("empty owner list = nobody", r, "not_allowed")
         E.write_cfg('["basic:owner"]', False)
-        _, r = await dial(f"?ticket={await ticket(s)}"); rec("disabled plugin refuses at once", r in (4404, "http403", "http404"), r)
+        _, r = await dial(f"?ticket={await ticket(s)}"); got = new_audit()  # disabled plugin is unloaded: its route is gone, so nothing of it may run
+        rec("disabled plugin refuses at once", r in (4404, "http403", "http404") and got in ([], ["disabled"]), f"{r} audit={got}")
         E.write_cfg('["basic:owner"]', True)
+        ws, r = await dial(f"?ticket={await ticket(s)}")
+        rec("re-enabled plugin serves the owner again", r == "open" and b"BACK_OK" in await run(ws, "echo BACK_O\"K\"", "BACK_OK"), r)
+        await shut(ws)
     async with jar() as s:  # last: it trips the login rate limit
         codes = [await login(s, f"bad{i}") for i in range(30)]
-        rec("password guessing rate-limited", 429 in codes)
+        first = codes.index(429) if 429 in codes else -1
+        rec("password guessing rate-limited", 0 < first <= 10 and set(codes[:first]) == {401}
+            and set(codes[first:]) == {429}, f"first 429 at try {first + 1}")
 
 
 if __name__ == "__main__":

@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # One command for every test layer.
-#   tests/run-all.sh           offline layers only (safe anywhere, what GitHub runs)
+#   tests/run-all.sh --partial offline layers only (safe anywhere, what GitHub runs)
+#   Without --partial any skipped layer FAILS the run: a green result means every layer ran.
 #   tests/run-all.sh --live    also the read-only checks against the running robweb site,
 #                              plus the web-terminal attack test (own throwaway dashboard)
 #   tests/run-all.sh --live --browser   also the real-browser suite (needs signed-in Chromium on :9222)
 set -uo pipefail
 cd "$(dirname "$0")/.."
-LIVE=0; BROWSER=0
-for a in "$@"; do case "$a" in --live) LIVE=1;; --browser) BROWSER=1;; esac; done
+LIVE=0; BROWSER=0; PARTIAL=0
+for a in "$@"; do case "$a" in --live) LIVE=1;; --browser) BROWSER=1;; --partial) PARTIAL=1;; esac; done
 declare -a NAMES RESULTS
 run() { local name="$1"; shift; echo; echo "===== $name"; if "$@"; then RESULTS+=("PASS  $name"); else RESULTS+=("FAIL  $name"); fi; }
 skip() { RESULTS+=("SKIP  $1 ($2)"); }
@@ -39,4 +40,6 @@ else skip "live: real browser" "add --browser"; fi
 
 echo; echo "===== SUMMARY"; printf '%s\n' "${RESULTS[@]}"
 for r in "${RESULTS[@]}"; do [[ $r == FAIL* ]] && exit 1; done
+if [ $PARTIAL = 0 ]; then for r in "${RESULTS[@]}"; do
+  [[ $r == SKIP* ]] && { echo "Skipped layers count as failure (use --partial to allow)"; exit 1; }; done; fi
 exit 0

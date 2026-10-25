@@ -2,7 +2,8 @@
 
 Goal: Desktop Web should behave like the native Hermes Desktop app, from any browser.
 
-Audited 2026-10-24 against live image `e0ab439` (renderer Hermes v0.22.0) and the
+Audited 2026-10-24 against live image `e0ab439` (renderer Hermes v0.22.0); the gaps it lists as
+fixed shipped in `9bee7a8`/`0c950ff`. Re-run `tests/parity/` to refresh this audit. Original scope: the
 native preload from Hermes v0.22.5.
 
 ## How the web version works

@@ -5,7 +5,9 @@ services:
     pull_policy: never
     container_name: hermes-desktop-web
     restart: unless-stopped
-    network_mode: bridge
+    # Own bridge (host interface hdw0) so the host firewall can let ONLY this container
+    # reach the preview relay (:18091) and dashboard (:9119). See deploy/robweb/firewall.sh.
+    networks: [hdw]
     extra_hosts:
       - host.docker.internal:host-gateway
     ports:
@@ -40,3 +42,12 @@ services:
       hermes.adapter.commit: 5e9d93705160ae7d4610316ef4feaf05191e7244
       hermes.renderer.commit: e06df9c2eae6901f4c88f464e0ae6e753c0428b8
       hermes.access: loopback-only
+networks:
+  hdw:
+    name: hdw
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: hdw0
+    ipam:
+      config:
+        - subnet: 10.231.90.0/24

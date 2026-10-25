@@ -74,11 +74,14 @@ def anonymous(a):
     code = raw_ws_upgrade(b, "/api/ws?ticket=forged", "Origin: https://evil.example\r\n")
     check("websocket from a foreign site with forged pass is refused (401/403)", code in (401, 403), f"got {code}")
     # 4. Path tricks can't read server files.
+    _, _, INDEX = http(b, "/")
     for path in ["/../../../../etc/passwd", "/%2e%2e/%2e%2e/%2e%2e/etc/passwd", "/..%2f..%2f..%2fetc%2fpasswd",
                  "/static/..%252f..%252fetc/passwd", "/web-bridge.js/../../../etc/passwd", "//etc/passwd",
                  "/api/../../etc/passwd", "/index.html%00.js"]:
         code, _, body = http(b, path)
-        check(f"path trick {path} leaks nothing", b"root:x:" not in body and b"nginx:" not in body[:5000], f"got {code}")
+        # Either refused, or the app's own index page (SPA fallback) -- never any other file.
+        check(f"path trick {path} leaks nothing", code in (400, 403, 404) or (code == 200 and body == INDEX),
+              f"got {code}")
     # 5. Security headers + no version banner.
     code, h, body = http(b, "/")
     hl = {k.lower(): v for k, v in h.items()}
@@ -113,8 +116,21 @@ def anonymous(a):
     code, _, _ = http(b, "/")
     check("server still healthy after attacks", code == 200, f"got {code}")
 
+def relay_isolation():
+    """The preview relay has no login of its own: only Desktop Web's container may reach it."""
+    probe = "wget -T 4 -q -O /dev/null http://172.17.0.1:18091/healthz && echo REACHED || echo BLOCKED"
+    ours = subprocess.run(["docker", "exec", "hermes-desktop-web", "sh", "-c",
+                           probe.replace("172.17.0.1", "host.docker.internal")], capture_output=True, text=True).stdout
+    check("Desktop Web container can reach the preview relay", "REACHED" in ours, ours.strip()[:60])
+    img = json.loads(subprocess.check_output(["docker", "inspect", "hermes-desktop-web"], text=True))[0]["Config"]["Image"]
+    other = subprocess.run(["docker", "run", "--rm", "--network", "bridge", "--entrypoint", "sh", img, "-c", probe],
+                           capture_output=True, text=True, timeout=60).stdout
+    check("another container is refused by the preview relay", "BLOCKED" in other, other.strip()[:60])
+
+
 def container(a):
-    if a.no_docker: return
+    if a.no_docker:
+        record("container hardening + relay isolation checks", "FAIL", "skipped by --no-docker"); return
     try:
         info = json.loads(subprocess.check_output(["docker", "inspect", "hermes-desktop-web"], text=True))[0]
     except Exception as e:
@@ -139,7 +155,9 @@ def container(a):
             exposed = [l for l in lines if re.search(rf"(0\.0\.0\.0|\[::\]|\*):{port}\s", l)]
             if lines: check(f"{label} (:{port}) not listening on all interfaces", not exposed, exposed[0].split()[3] if exposed else "")
         if re.search(r"(0\.0\.0\.0|\*):9119\s", ss):
-            record("Hermes dashboard (:9119) listens on all interfaces", "WARN", "reachable from the local network unless a firewall blocks it")
+            fw = subprocess.run(["sudo", "-n", "iptables", "-S", "INPUT"], capture_output=True, text=True).stdout
+            check("dashboard :9119 (all interfaces) is firewalled to lo/docker only",
+                  "--dport 9119 -j DROP" in fw, "no DROP rule for 9119 (or sudo -n unavailable)")
     except Exception as e:
         record("listening ports", "FAIL", "could not list ports: " + str(e)[:80])
 
@@ -182,6 +200,7 @@ def main():
     ap.add_argument("--no-docker", action="store_true")
     a = ap.parse_args()
     anonymous(a); container(a)
+    if not a.no_docker: relay_isolation()
     if a.signed_in: signed_in(a)
     for n, s, note in results: print(f"{s:4}  {n}" + (f"  — {note}" if note else ""))
     f = sum(r[1] == "FAIL" for r in results)
