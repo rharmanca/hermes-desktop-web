@@ -35,6 +35,78 @@
 
   let redirecting = false
 
+  // ── Small shared helpers for the desktop-parity features below.
+  const LAST_PROFILE_KEY = 'hermes.web.lastProfile'
+  const DEFAULT_PROFILE_KEY = 'hermes.web.defaultProfile'
+  const NOTIFY_ASKED_KEY = 'hermes.web.notifyAsked'
+  const CLIPBOARD_IMAGE_MAX = 25 * 1024 * 1024
+  const PROFILE_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
+  const cleanProfile = v => (typeof v === 'string' && PROFILE_RE.test(v.trim()) && !v.includes('..') ? v.trim() : null)
+  const readStore = k => { try { return cleanProfile(localStorage.getItem(k)) } catch { return null } }
+  const writeStore = (k, v) => { try { localStorage.setItem(k, v) } catch { /* private mode */ } }
+  const focusSessionSubs = new Set(), notifyActivateSubs = new Set(), defaultChangedSubs = new Set()
+  const on = (set, cb) => { if (typeof cb !== 'function') return () => {}; set.add(cb); return () => set.delete(cb) }
+  const emit = (set, v) => { for (const cb of [...set]) { try { cb(v) } catch (e) { console.error(e) } } }
+
+  function readDefaultRoute() {
+    try {
+      const r = JSON.parse(localStorage.getItem(DEFAULT_PROFILE_KEY) || 'null')
+      const prof = cleanProfile(r && r.profile)
+      return prof ? { connectionId: typeof r.connectionId === 'string' ? r.connectionId : null, profile: prof } : null
+    } catch { return null }
+  }
+
+  const params = () => new URLSearchParams(location.search)
+  const isMainTab = () => { const p = params(); return !p.has('win') && !p.has('peer') }
+
+  function rememberProfile(name) {
+    const prof = cleanProfile(name)
+    if (!prof) return { profile: readStore(LAST_PROFILE_KEY) }
+    writeStore(LAST_PROFILE_KEY, prof)
+    // Keep the address bar honest so reload/bookmark land on this profile.
+    if (isMainTab() && params().get('profile') !== prof) {
+      try {
+        const u = new URL(location.href)
+        u.searchParams.set('profile', prof)
+        history.replaceState(history.state, '', u.pathname + u.search + u.hash)
+      } catch { /* ignore */ }
+    }
+    return { profile: prof }
+  }
+
+  function openTab(path) {
+    const w = window.open(path, '_blank')
+    if (!w) return { ok: false, error: 'popup-blocked' }
+    try { w.opener = null } catch { /* ignore */ }
+    return { ok: true }
+  }
+
+  // Boot: a plain visit (no ?profile=, not a pop-out) lands on the saved
+  // default, else the last profile used in this browser. Runs before the app
+  // bundle reads location.search.
+  try {
+    const p = params()
+    const start = (readDefaultRoute() || {}).profile || readStore(LAST_PROFILE_KEY)
+    if (isMainTab() && !p.has('profile') && start) {
+      p.set('profile', start)
+      history.replaceState(history.state, '', location.pathname + '?' + p + location.hash)
+    }
+  } catch { /* storage blocked: default boot */ }
+
+  // Browsers only show the permission prompt from a user gesture. Ask once,
+  // on the first click/keypress, and never re-ask after an answer.
+  if (typeof Notification === 'function' && typeof addEventListener === 'function') {
+    const ask = () => {
+      removeEventListener('pointerdown', ask, true); removeEventListener('keydown', ask, true)
+      try {
+        if (Notification.permission !== 'default' || localStorage.getItem(NOTIFY_ASKED_KEY)) return
+        localStorage.setItem(NOTIFY_ASKED_KEY, '1')
+        Notification.requestPermission().catch(() => {})
+      } catch { /* ignore */ }
+    }
+    addEventListener('pointerdown', ask, true); addEventListener('keydown', ask, true)
+  }
+
   // An expired edge sign-in (e.g. Cloudflare Access) answers with a redirect
   // to another origin: fetch() then fails as a bare TypeError, or follows to
   // an HTML page. The app swallows mint errors and dials an empty URL, which
@@ -409,8 +481,82 @@
 
       return path
     },
-    notify: payload => {
-      try { new Notification(payload.title || 'Hermes', { body: payload.body || '' }) } catch { /* no permission */ }
+    // Browser notifications, shaped like electron/notification-ipc.ts: clicking
+    // focuses this tab, then emits focus-session / notification-activate.
+    notify: async payload => {
+      if (typeof Notification !== 'function' || Notification.permission !== 'granted') return false
+      try {
+        const n = new Notification((payload && payload.title) || 'Hermes', {
+          body: (payload && payload.body) || '',
+          silent: Boolean(payload && payload.silent),
+          tag: (payload && (payload.tag || payload.sessionId)) || undefined
+        })
+        n.onclick = () => {
+          try { window.focus() } catch { /* ignore */ }
+          n.close()
+          const focusId = payload && (payload.focusSessionId || payload.sessionId)
+          if (focusId) emit(focusSessionSubs, focusId)
+          if (payload && (payload.activate || payload.notifyId)) {
+            emit(notifyActivateSubs, { activate: payload.activate, notifyId: payload.notifyId, tag: payload.tag })
+          }
+        }
+        return true
+      } catch { return false }
+    },
+    // Native pastes from the OS clipboard; the browser equivalent is the async
+    // Clipboard API (needs a user gesture + permission; '' means "no image").
+    saveClipboardImage: async () => {
+      try {
+        if (!navigator.clipboard || typeof navigator.clipboard.read !== 'function') return ''
+        for (const item of await navigator.clipboard.read()) {
+          const type = item.types.find(t => /^image\/(png|jpe?g|gif|webp|bmp)$/i.test(t))
+          if (!type) continue
+          const blob = await item.getType(type)
+          if (!blob || !blob.size || blob.size > CLIPBOARD_IMAGE_MAX) return ''
+          const ext = type.split('/')[1].toLowerCase().replace('jpeg', 'jpg')
+          const path = `/browser-upload/${++attachSeq}/pasted-image.${ext}`
+          clientFiles.set(path, blob)
+          return path
+        }
+      } catch { /* denied or unsupported */ }
+      return ''
+    },
+    // Windows → browser tabs, using the same URLs electron/session-windows.ts builds.
+    openSessionWindow: async (sessionId, opts = {}) => {
+      if (typeof sessionId !== 'string' || !sessionId.trim()) return { ok: false, error: 'invalid-session-id' }
+      const q = new URLSearchParams({ win: 'secondary' })
+      if (opts.watch) q.set('watch', '1')
+      const prof = cleanProfile(opts.profile)
+      if (prof) q.set('profile', prof)
+      if (opts.connectionId !== undefined) q.set('connectionId', opts.connectionId ?? '')
+      return openTab(`/?${q}#/${encodeURIComponent(sessionId.trim())}`)
+    },
+    openWindow: async (options = {}) => {
+      const q = new URLSearchParams({ peer: '1' })
+      const prof = cleanProfile(options && options.profile)
+      if (prof) {
+        q.set('profile', prof)
+        q.set('connectionId', options.connectionId ?? '')
+        if (options.profileWindow) q.set('profileWindow', '1')
+      }
+      return openTab(`/?${q}`)
+    },
+    // Last-used and default profile, remembered per browser (native keeps
+    // these in the app's settings file). Boot applies them via ?profile=.
+    profile: {
+      get: async () => ({ profile: readStore(LAST_PROFILE_KEY) }),
+      remember: async name => rememberProfile(name),
+      set: async name => rememberProfile(name),
+      getDefault: async () => readDefaultRoute(),
+      setDefault: async route => {
+        const prof = cleanProfile(route && route.profile)
+        if (!prof) throw new Error('invalid profile')
+        const saved = { connectionId: (route && route.connectionId) ?? null, profile: prof }
+        writeStore(DEFAULT_PROFILE_KEY, JSON.stringify(saved))
+        emit(defaultChangedSubs, saved)
+        return saved
+      },
+      onDefaultChanged: cb => on(defaultChangedSubs, cb)
     },
     setActiveWork: noop,
     // Workspace cwd lives on the gateway host in web mode — echo requests
@@ -466,9 +612,9 @@
     onPowerResume: subscribe,
     onWindowStateChanged: subscribe,
     onDeepLink: subscribe,
-    onFocusSession: subscribe,
+    onFocusSession: cb => on(focusSessionSubs, cb),
     onNotificationAction: subscribe,
-    onNotificationActivate: subscribe,
+    onNotificationActivate: cb => on(notifyActivateSubs, cb),
     onExternalOpenFailed: subscribe,
     onBrowserPopoutClosed: subscribe
   }
