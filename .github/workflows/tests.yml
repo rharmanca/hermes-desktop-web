@@ -39,7 +39,7 @@ jobs:
       - uses: actions/setup-python@v5
         id: py314
         with: { python-version: "3.14" }   # same Python as the Hermes install on robweb
-      - name: Web-terminal plugin tests (needs Hermes source; plugin stays disabled in production)
+      - name: Web-terminal plugin tests (needs Hermes source; live for the owner only)
         run: |
           git clone -q --depth 1 --branch "${HERMES_REF:-v0.22.2}" https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
           "${{ steps.py314.outputs.python-path }}" -m venv "$RUNNER_TEMP/hv"

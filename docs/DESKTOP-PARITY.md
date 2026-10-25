@@ -42,7 +42,8 @@ missing APIs and logged **0 page errors**.
 Desktop-only, intentionally skipped: HUD, pet overlay, quick entry, tray, battery,
 keep-awake, app updates/uninstall, F12, local models, bootstrap, desktop plugins.
 
-Web terminal stays disabled pending security review (PER-309).
+Web terminal: security-reviewed and live for the owner only (`allowed_users`); attack suite in
+`tests/web-terminal/run_terminal_attack.py`.
 
 ## Recommended order
 

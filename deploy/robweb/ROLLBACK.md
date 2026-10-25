@@ -17,4 +17,4 @@ It retags the rollback image as the running tag, recreates the container, waits 
 restoring the live compose.yaml from its backup first. Firewall: `deploy/robweb/firewall.sh`
 only adds rules; the pre-change rules are saved in `/etc/iptables/backup-*`.
 
-Tested: see the commit that added this file (rollback was run to the previous image and back).
+Tested 2026-10-25: rolled back to rollback-pre-0c950ff (healthy, revision 9bee7a8) and forward again (healthy, 0c950ff); live smoke 15/15 afterwards.
