@@ -83,4 +83,5 @@ core gate that stamps a test identity.
 
 1. Run the tests above.
 2. `GET /api/plugins/web-terminal/health` → `contract_ok: true`, `allowed_users_configured: true`.
-3. Open the Terminal tab once as the allowed user.
+3. `python3 tests/web-terminal/run_terminal_attack.py` (attacks a throwaway dashboard; never the live one).
+4. Open the Terminal tab once as the allowed user.

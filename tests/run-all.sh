@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One command for every test layer.
 #   tests/run-all.sh           offline layers only (safe anywhere, what GitHub runs)
-#   tests/run-all.sh --live    also the read-only checks against the running robweb site
+#   tests/run-all.sh --live    also the read-only checks against the running robweb site,
+#                              plus the web-terminal attack test (own throwaway dashboard)
 #   tests/run-all.sh --live --browser   also the real-browser suite (needs signed-in Chromium on :9222)
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -24,13 +25,14 @@ if [ -x "${PREVIEW_CHROMIUM:-/usr/lib/chromium/chromium}" ]; then
 else skip "e2e: browser-pane relay with real Chromium" "chromium not installed"; fi
 WT_PY="${HERMES_AGENT_SRC:-$HOME/.hermes/hermes-agent}/.venv/bin/python"
 if [ -x "$WT_PY" ]; then
-  run "unit: web-terminal plugin (disabled in prod)" env HERMES_HOME="$(mktemp -d)" PYTHONPATH="${HERMES_AGENT_SRC:-$HOME/.hermes/hermes-agent}" \
+  run "unit: web-terminal plugin (on for owner only)" env HERMES_HOME="$(mktemp -d)" PYTHONPATH="${HERMES_AGENT_SRC:-$HOME/.hermes/hermes-agent}" \
     "$WT_PY" -m pytest gateway-plugin/web-terminal/tests -q -o addopts="" -p no:cacheprovider
 else skip "unit: web-terminal plugin" "needs hermes-agent venv"; fi
 
 if [ $LIVE = 1 ]; then
   run "live: smoke" tests/live-smoke.sh
   run "live: security" python3 tests/security/run_security_tests.py
+  run "attack: web terminal (throwaway dashboard)" python3 tests/web-terminal/run_terminal_attack.py
 else skip "live: smoke + security" "add --live"; fi
 if [ $BROWSER = 1 ]; then run "live: real browser" python3 tests/browser/run_browser_tests.py
 else skip "live: real browser" "add --browser"; fi
