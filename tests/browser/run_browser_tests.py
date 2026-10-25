@@ -169,7 +169,9 @@ def expired_signin_reloads_to_sign_in(app, a):
     app.page.evaluate("window.__suiteMark = 1")
     with app.page.expect_event("load", timeout=15000):
         app.page.evaluate("void window.hermesDesktop.getGatewayWsUrl().catch(()=>{})")
-    app.page.wait_for_selector(COMPOSER, timeout=45000)
+    # app shell, not the composer: a remembered profile may reopen the last chat,
+    # which shows a loading state while the gateway is unreachable
+    app.page.wait_for_selector("text=New session", timeout=45000)
     check(app.page.evaluate("window.__suiteMark") is None, "page did not reload")
     # second expiry right after: guard must stop a reload loop
     app.page.evaluate("window.__suiteMark = 2")
