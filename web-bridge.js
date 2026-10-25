@@ -248,6 +248,25 @@
   // handle to re-read them). In web mode the browser owns the bytes, so
   // paths are tokens into this map.
   const clientFiles = new Map()
+
+  const CLIPBOARD_TIMEOUT_MS = 20000
+  let clipboardRead = null
+  async function readClipboardImage() {
+    try {
+      if (!navigator.clipboard || typeof navigator.clipboard.read !== 'function') return ''
+      for (const item of await navigator.clipboard.read()) {
+        const type = item.types.find(t => /^image\/(png|jpe?g|gif|webp|bmp)$/i.test(t))
+        if (!type) continue
+        const blob = await item.getType(type)
+        if (!blob || !blob.size || blob.size > CLIPBOARD_IMAGE_MAX) return ''
+        const ext = type.split('/')[1].toLowerCase().replace('jpeg', 'jpg')
+        const path = `/browser-upload/${++attachSeq}/pasted-image.${ext}`
+        clientFiles.set(path, blob)
+        return path
+      }
+    } catch { /* denied or unsupported */ }
+    return ''
+  }
   let attachSeq = 0
 
   function blobToDataUrl(blob) {
@@ -505,22 +524,12 @@
     },
     // Native pastes from the OS clipboard; the browser equivalent is the async
     // Clipboard API (needs a user gesture + permission; '' means "no image").
-    saveClipboardImage: async () => {
-      try {
-        if (!navigator.clipboard || typeof navigator.clipboard.read !== 'function') return ''
-        for (const item of await navigator.clipboard.read()) {
-          const type = item.types.find(t => /^image\/(png|jpe?g|gif|webp|bmp)$/i.test(t))
-          if (!type) continue
-          const blob = await item.getType(type)
-          if (!blob || !blob.size || blob.size > CLIPBOARD_IMAGE_MAX) return ''
-          const ext = type.split('/')[1].toLowerCase().replace('jpeg', 'jpg')
-          const path = `/browser-upload/${++attachSeq}/pasted-image.${ext}`
-          clientFiles.set(path, blob)
-          return path
-        }
-      } catch { /* denied or unsupported */ }
-      return ''
-    },
+    // One read at a time; an unanswered permission prompt leaves read() pending
+    // forever, so give up after CLIPBOARD_TIMEOUT_MS and report "no image".
+    saveClipboardImage: () => (clipboardRead ||= Promise.race([
+      readClipboardImage(),
+      new Promise(r => setTimeout(() => r(''), CLIPBOARD_TIMEOUT_MS))
+    ]).finally(() => { clipboardRead = null })),
     // Windows → browser tabs, using the same URLs electron/session-windows.ts builds.
     openSessionWindow: async (sessionId, opts = {}) => {
       if (typeof sessionId !== 'string' || !sessionId.trim()) return { ok: false, error: 'invalid-session-id' }

@@ -13,7 +13,7 @@ function storage(init = {}) {
   return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: k => m.delete(k), _m: m }
 }
 
-function load({ search = '', hash = '#/', local = {}, permission = 'default', clipboard, openReturns = {} } = {}) {
+function load({ search = '', hash = '#/', local = {}, permission = 'default', clipboard, openReturns = {}, timers = setTimeout } = {}) {
   const listeners = {}
   const opened = []
   const notes = []
@@ -40,7 +40,7 @@ function load({ search = '', hash = '#/', local = {}, permission = 'default', cl
   }
   const ctx = {
     window, location, history, localStorage: storage(local), sessionStorage: storage(),
-    URL, URLSearchParams, Blob, FormData, TextDecoder, setTimeout, clearTimeout, console, Promise,
+    URL, URLSearchParams, Blob, FormData, TextDecoder, setTimeout: timers, clearTimeout, console, Promise,
     fetch: async () => ({ ok: true, status: 200, headers: { get: () => 'application/json' }, text: async () => '{}', json: async () => ({}) }),
     navigator: { userAgent: 'test', clipboard }, crypto: globalThis.crypto, Notification: FakeNotification,
     addEventListener: (t, f) => { (listeners[t] ||= new Set()).add(f) },
@@ -255,4 +255,21 @@ test('paste image returns "" for: no image, denied, unsupported, empty, oversize
     { read: async () => [item('image/svg+xml')] }
   ]
   for (const clipboard of cases) assert.equal(await load({ clipboard }).bridge.saveClipboardImage(), '')
+})
+
+test('unanswered clipboard prompt gives up with "" instead of hanging', async () => {
+  const fast = (f, ms) => setTimeout(f, ms >= 20000 ? 5 : ms)
+  const { bridge } = load({ timers: fast, clipboard: { read: () => new Promise(() => {}) } })
+  assert.equal(await bridge.saveClipboardImage(), '')
+})
+
+test('repeated paste clicks share one clipboard read (no prompt pile-up)', async () => {
+  let reads = 0
+  const { bridge } = load({ clipboard: { read: async () => { reads++; await new Promise(r => setTimeout(r, 10)); return [item('image/png', 5)] } } })
+  const got = await Promise.all([1, 2, 3, 4, 5].map(() => bridge.saveClipboardImage()))
+  assert.equal(reads, 1)
+  assert.equal(new Set(got).size, 1)
+  assert.match(got[0], /pasted-image\.png$/)
+  await bridge.saveClipboardImage()
+  assert.equal(reads, 2, 'a later click reads again')
 })
