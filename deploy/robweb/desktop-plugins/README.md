@@ -24,3 +24,15 @@ To remove a plugin, delete its folder, manifest entry, `SHA256SUMS` line and `CO
 | Plugin | Version | Source | Commit |
 |---|---|---|---|
 | profile-picker | 1.1.0 (MIT) | https://github.com/weltmaister/hermes-profile-picker | `9a38fa52616c8b1be5397c4d922e80a2c754613d` |
+| waypoint | 2.5.0 (MIT) | https://github.com/mochiNJ/hermes-waypoint | `971bab6762466bfdf6036aeaeb35352d6308f61d` |
+
+### Reviewed exceptions
+
+- **waypoint**: reads page layout only (`document.querySelector`, `getBoundingClientRect`,
+  `window.innerWidth/innerHeight`) to place its status card beside the sidebar, and writes to the
+  clipboard only when you click Export. Gateway calls are limited to `session.list`,
+  `session.history`, `session.archive` (only when you press Archive) and `llm.oneshot` (AI ideas are
+  off by default; Power up runs only when pressed). `tests/desktop-plugins.test.mjs` pins this exact
+  set, so an update that adds browser access fails the tests until it is re-reviewed.
+  Its Python half (aux-task registration + observe-only call log) is installed per profile with
+  `hermes plugins install waypoint`.

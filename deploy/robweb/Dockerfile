@@ -9,11 +9,12 @@ COPY --chmod=644 deploy/robweb/web-preview.js /usr/share/nginx/html/web-preview.
 # does not match its pinned checksum.
 COPY --chmod=644 deploy/robweb/desktop-plugins/manifest.json /usr/share/nginx/html/desktop-plugins/manifest.json
 COPY --chmod=644 deploy/robweb/desktop-plugins/profile-picker/plugin.js /usr/share/nginx/html/desktop-plugins/profile-picker/plugin.js
+COPY --chmod=644 deploy/robweb/desktop-plugins/waypoint/plugin.js /usr/share/nginx/html/desktop-plugins/waypoint/plugin.js
 COPY --chmod=644 deploy/robweb/desktop-plugins/SHA256SUMS /tmp/desktop-plugins.SHA256SUMS
 # Cache-bust: reference the bridge by content hash so CDN/browser caches can never serve a stale copy.
 USER root
 RUN set -e; cd /usr/share/nginx/html/desktop-plugins && sha256sum -c /tmp/desktop-plugins.SHA256SUMS && rm /tmp/desktop-plugins.SHA256SUMS; \
-    chmod 755 /usr/share/nginx/html/desktop-plugins /usr/share/nginx/html/desktop-plugins/profile-picker
+    chmod 755 /usr/share/nginx/html/desktop-plugins /usr/share/nginx/html/desktop-plugins/profile-picker /usr/share/nginx/html/desktop-plugins/waypoint
 RUN set -e; H=$(sha256sum /usr/share/nginx/html/web-bridge.js | cut -c1-12); \
     sed -i "s#src=\"./web-bridge.js\"#src=\"./web-bridge.js?v=$H\"#" /usr/share/nginx/html/index.html; \
     grep -q "web-bridge.js?v=$H" /usr/share/nginx/html/index.html; \

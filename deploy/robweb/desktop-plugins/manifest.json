@@ -9,6 +9,15 @@
       "source": "https://github.com/weltmaister/hermes-profile-picker",
       "commit": "9a38fa52616c8b1be5397c4d922e80a2c754613d",
       "path": "desktop/plugin.js"
+    },
+    {
+      "name": "waypoint",
+      "sha256": "a0ac3637225cc324c6f08c45ce005edb87eb4f654a148cb22e92117ecafa3f15",
+      "version": "2.5.0",
+      "license": "MIT",
+      "source": "https://github.com/mochiNJ/hermes-waypoint",
+      "commit": "971bab6762466bfdf6036aeaeb35352d6308f61d",
+      "path": "desktop/plugin.js"
     }
   ]
 }

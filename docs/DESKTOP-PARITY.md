@@ -47,7 +47,8 @@ Desktop plugins: server-approved only, read-only. The app's own plugin loader re
 hands it a `plugin.js` only if the plugin is in `manifest.json` and its bytes match the pinned
 SHA-256 (the image build re-checks `SHA256SUMS`). Install/remove from the browser are refused.
 Loaded plugins run with full app authority, so each one is a reviewed commit. Currently:
-Profile Picker 1.1.0 (`weltmaister/hermes-profile-picker@9a38fa5`). See
+Profile Picker 1.1.0 (`weltmaister/hermes-profile-picker@9a38fa5`) and Waypoint 2.5.0
+(`mochiNJ/hermes-waypoint@971bab6`, session status bars; its Python half is installed per profile). See
 `deploy/robweb/desktop-plugins/README.md`; tests in `tests/desktop-plugins.test.mjs` and the nginx suite.
 
 Web terminal: security-reviewed and live for the owner only (`allowed_users`); attack suite in
