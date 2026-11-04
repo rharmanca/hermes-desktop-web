@@ -99,6 +99,24 @@ check("preview websocket allowed when signed in, goes to relay /ws", c == 101 an
 c, _, _ = get("/_preview_auth")
 check("internal auth check not reachable from outside", c == 404, f"{c}")
 
+# Server-approved Desktop plugins: only manifest + <name>/plugin.js, revalidated, never the SPA page.
+c, hh, b = get("/desktop-plugins/manifest.json")
+check("plugin manifest served", c == 200 and b"profile-picker" in b, f"{c}")
+check("plugin manifest revalidated", "no-cache" in hh.get("cache-control", ""), hh.get("cache-control"))
+c, hh, b = get("/desktop-plugins/profile-picker/plugin.js")
+check("approved plugin file served", c == 200 and b"@hermes/plugin-sdk" in b, f"{c}")
+for k, v in [("x-frame-options", "DENY"), ("x-content-type-options", "nosniff"), ("referrer-policy", "same-origin")]:
+    check(f"plugin file: header {k}", hh.get(k) == v, f"{hh.get(k)!r}")
+for p in ["/desktop-plugins/", "/desktop-plugins/profile-picker/", "/desktop-plugins/profile-picker/LICENSE",
+          "/desktop-plugins/SHA256SUMS", "/desktop-plugins/missing/plugin.js", "/desktop-plugins/profile-picker/other.js",
+          "/desktop-plugins/Evil/plugin.js"]:
+    c, _, b = get(p)
+    check(f"{p} not served (404, no listing, no app page)", c in (400, 404) and b"web-bridge.js" not in b and b"Index of" not in b, f"{c}")
+for p in ["/desktop-plugins/../../../etc/passwd", "/desktop-plugins/%2e%2e/%2e%2e/%2e%2e/etc/passwd",
+          "/desktop-plugins/..%2f..%2f..%2fetc/passwd", "/desktop-plugins/profile-picker/..%2f..%2f..%2f..%2fetc%2fpasswd"]:
+    c, _, b = get(p)
+    check(f"{p} cannot escape the web root", b"root:" not in b, f"{c}")
+
 # Limits
 c, _, _ = get("/api/upload", method="POST", body=b"x" * (17 * 1024 * 1024), headers={"Content-Type": "application/octet-stream"})
 check("upload over 16 MB rejected (413)", c == 413, f"{c}")

@@ -15,7 +15,9 @@ cleanup() { docker rm -f "$ID-nginx" "$ID-stub" >/dev/null 2>&1 || true; docker 
 WWW="$(mktemp -d)"; trap cleanup EXIT
 printf '<html><head><script src="./web-bridge.js?v=test"></script></head><body>app</body></html>' > "$WWW/index.html"
 mkdir -p "$WWW/assets"; python3 -c "print('console.log(1);'*500)" > "$WWW/assets/app-Ab12Cd.js"
-cp "$ROOT/web-bridge.js" "$ROOT/deploy/robweb/web-preview.js" "$WWW/"; chmod -R a+rX "$WWW"
+cp "$ROOT/web-bridge.js" "$ROOT/deploy/robweb/web-preview.js" "$WWW/"
+# Same desktop-plugins files the image ships, plus extras that must NOT be served.
+cp -r "$ROOT/deploy/robweb/desktop-plugins" "$WWW/desktop-plugins"; chmod -R a+rX "$WWW"
 
 docker network create "$ID" >/dev/null
 docker run -d --name "$ID-stub" --network "$ID" --network-alias host.docker.internal \

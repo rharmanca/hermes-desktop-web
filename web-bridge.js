@@ -407,7 +407,117 @@
     }
   }
 
+  // ── Desktop plugins, server-managed and read-only. Electron reads
+  // `<app root>/desktop-plugins/<name>/plugin.js` from local disk; here the
+  // "disk" is a fixed, same-origin folder baked into the image
+  // (deploy/robweb/desktop-plugins). Only names in its manifest exist, and a
+  // plugin file is handed to the app's loader only if its bytes match the
+  // manifest's SHA-256. Nothing can be installed or removed from the browser:
+  // adding a plugin is a reviewed commit + image rebuild. Paths outside the
+  // folder keep the old no-op behaviour (the universal stub below).
+  const PLUGIN_ROOT = '/desktop-plugins'
+  const PLUGIN_ENTRY = 'plugin.js'
+  const PLUGIN_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/
+  const PLUGIN_SHA_RE = /^[0-9a-f]{64}$/
+  const PLUGIN_MAX_BYTES = 1024 * 1024
+  const PLUGIN_WATCH_ID = 'hdw-desktop-plugins-root'
+  const PLUGIN_READ_ONLY = 'Desktop Web loads only server-approved plugins. Ask the admin to add or remove it on the server.'
+  let pluginManifest = null
+
+  function loadPluginManifest() {
+    if (!pluginManifest) {
+      pluginManifest = fetch(`${PLUGIN_ROOT}/manifest.json`, {
+        credentials: 'same-origin', cache: 'no-cache', redirect: 'error'
+      })
+        .then(r => (r.ok ? r.json() : { plugins: [] }))
+        .then(m => {
+          const out = new Map()
+
+          for (const p of Array.isArray(m && m.plugins) ? m.plugins : []) {
+            if (p && typeof p.name === 'string' && PLUGIN_NAME_RE.test(p.name) &&
+                typeof p.sha256 === 'string' && PLUGIN_SHA_RE.test(p.sha256) && !out.has(p.name)) {
+              out.set(p.name, p.sha256)
+            }
+          }
+
+          return out
+        })
+        .catch(() => {
+          pluginManifest = null // retry on the next scan
+
+          return new Map()
+        })
+    }
+
+    return pluginManifest
+  }
+
+  const isPluginPath = p => typeof p === 'string' && (p === PLUGIN_ROOT || p.startsWith(`${PLUGIN_ROOT}/`))
+
+  // '/desktop-plugins/<name>/plugin.js' -> '<name>' when listed, else null.
+  async function pluginNameForFile(path) {
+    const m = /^\/desktop-plugins\/([^/]+)\/plugin\.js$/.exec(path)
+
+    return m && (await loadPluginManifest()).has(m[1]) ? m[1] : null
+  }
+
+  async function readVerifiedPlugin(path) {
+    const name = await pluginNameForFile(path)
+
+    if (!name) throw new Error(`Not a server-approved desktop plugin: ${path}`)
+    if (!globalThis.crypto || !globalThis.crypto.subtle) throw new Error('Plugin check unavailable (needs HTTPS)')
+    const expected = (await loadPluginManifest()).get(name)
+    const r = await fetch(`${PLUGIN_ROOT}/${name}/${PLUGIN_ENTRY}`, {
+      credentials: 'same-origin', cache: 'no-cache', redirect: 'error'
+    })
+
+    if (!r.ok) throw new Error(`Plugin ${name} could not be read (HTTP ${r.status})`)
+    const bytes = await r.arrayBuffer()
+
+    if (bytes.byteLength > PLUGIN_MAX_BYTES) throw new Error(`Plugin ${name} is too large`)
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes)
+    const hex = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('')
+
+    if (hex !== expected) throw new Error(`Plugin ${name} failed its checksum; refusing to load it`)
+
+    return { path, text: new TextDecoder('utf-8', { fatal: true }).decode(bytes), truncated: false, byteSize: bytes.byteLength, mimeType: 'text/javascript' }
+  }
+
+  async function readPluginDir(path) {
+    const names = await loadPluginManifest()
+
+    if (path === PLUGIN_ROOT) {
+      return { entries: [...names.keys()].map(name => ({ name, path: `${PLUGIN_ROOT}/${name}`, isDirectory: true })) }
+    }
+    const m = /^\/desktop-plugins\/([^/]+)$/.exec(path)
+
+    if (m && names.has(m[1])) {
+      return { entries: [{ name: PLUGIN_ENTRY, path: `${path}/${PLUGIN_ENTRY}`, isDirectory: false }] }
+    }
+    throw new Error(`No such plugin folder: ${path}`)
+  }
+
+  const desktopPlugins = {
+    desktopPluginsRoot: async () => PLUGIN_ROOT,
+    // Electron copies unified-package halves into the root here; the server
+    // image is already reconciled at build time.
+    reconcileDesktopPlugins: async () => [],
+    readDir: path => (isPluginPath(path) ? readPluginDir(path) : universal),
+    readFileText: path => {
+      if (!isPluginPath(path)) return universal
+
+      return readVerifiedPlugin(path).catch(err => ({ ok: false, error: 'ENOENT', message: String(err && err.message || err), path }))
+    },
+    readPluginSource: path => readVerifiedPlugin(path),
+    // The folder only changes on a redeploy (which reloads the page), so the
+    // root watch is a fixed id that never fires: no 5-second polling.
+    watchDirectory: path => (path === PLUGIN_ROOT ? Promise.resolve({ id: PLUGIN_WATCH_ID, path }) : universal),
+    installDesktopPlugin: async () => ({ ok: false, error: PLUGIN_READ_ONLY }),
+    removeDesktopPlugin: async () => ({ ok: false, error: PLUGIN_READ_ONLY })
+  }
+
   const bridge = {
+    ...desktopPlugins,
     api,
     terminal: terminalApi,
     // Native browser file picker; resolves with token paths ([] on cancel).

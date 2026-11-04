@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "plugins": [
+    {
+      "name": "profile-picker",
+      "sha256": "7afa6d249acfb0950516b82ce1758fb8f014149d18bf2283e29a57c362347047",
+      "version": "1.1.0",
+      "license": "MIT",
+      "source": "https://github.com/weltmaister/hermes-profile-picker",
+      "commit": "9a38fa52616c8b1be5397c4d922e80a2c754613d",
+      "path": "desktop/plugin.js"
+    }
+  ]
+}

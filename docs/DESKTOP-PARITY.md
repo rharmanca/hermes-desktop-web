@@ -40,7 +40,15 @@ missing APIs and logged **0 page errors**.
 | 8 | `screenshot`, find-bar events | Minor; browser Cmd+F works | Low |
 
 Desktop-only, intentionally skipped: HUD, pet overlay, quick entry, tray, battery,
-keep-awake, app updates/uninstall, F12, local models, bootstrap, desktop plugins.
+keep-awake, app updates/uninstall, F12, local models, bootstrap.
+
+Desktop plugins: server-approved only, read-only. The app's own plugin loader reads
+`/desktop-plugins/` (baked into the image from `deploy/robweb/desktop-plugins/`); the bridge
+hands it a `plugin.js` only if the plugin is in `manifest.json` and its bytes match the pinned
+SHA-256 (the image build re-checks `SHA256SUMS`). Install/remove from the browser are refused.
+Loaded plugins run with full app authority, so each one is a reviewed commit. Currently:
+Profile Picker 1.1.0 (`weltmaister/hermes-profile-picker@9a38fa5`). See
+`deploy/robweb/desktop-plugins/README.md`; tests in `tests/desktop-plugins.test.mjs` and the nginx suite.
 
 Web terminal: security-reviewed and live for the owner only (`allowed_users`); attack suite in
 `tests/web-terminal/run_terminal_attack.py`.
