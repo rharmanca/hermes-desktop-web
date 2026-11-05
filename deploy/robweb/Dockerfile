@@ -10,11 +10,14 @@ COPY --chmod=644 deploy/robweb/web-preview.js /usr/share/nginx/html/web-preview.
 COPY --chmod=644 deploy/robweb/desktop-plugins/manifest.json /usr/share/nginx/html/desktop-plugins/manifest.json
 COPY --chmod=644 deploy/robweb/desktop-plugins/profile-picker/plugin.js /usr/share/nginx/html/desktop-plugins/profile-picker/plugin.js
 COPY --chmod=644 deploy/robweb/desktop-plugins/waypoint/plugin.js /usr/share/nginx/html/desktop-plugins/waypoint/plugin.js
+# gmail is not vendored (upstream licence is Private): fetched from the pinned
+# upstream commit, and ADD fails the build unless the bytes match this checksum.
+ADD --checksum=sha256:062af70aa6ce79baa3b4a231c5f934778b4682b6f1c4e3ceaecda6ee4cd0bf95 --chmod=644 https://raw.githubusercontent.com/guberm/hermes-gmail-desktop-plugin/c8cd0c2d140561a1dffb7432c6d02b63b2374888/plugins/gmail/desktop/plugin.js /usr/share/nginx/html/desktop-plugins/gmail/plugin.js
 COPY --chmod=644 deploy/robweb/desktop-plugins/SHA256SUMS /tmp/desktop-plugins.SHA256SUMS
 # Cache-bust: reference the bridge by content hash so CDN/browser caches can never serve a stale copy.
 USER root
 RUN set -e; cd /usr/share/nginx/html/desktop-plugins && sha256sum -c /tmp/desktop-plugins.SHA256SUMS && rm /tmp/desktop-plugins.SHA256SUMS; \
-    chmod 755 /usr/share/nginx/html/desktop-plugins /usr/share/nginx/html/desktop-plugins/profile-picker /usr/share/nginx/html/desktop-plugins/waypoint
+    chmod 755 /usr/share/nginx/html/desktop-plugins /usr/share/nginx/html/desktop-plugins/profile-picker /usr/share/nginx/html/desktop-plugins/waypoint /usr/share/nginx/html/desktop-plugins/gmail
 RUN set -e; H=$(sha256sum /usr/share/nginx/html/web-bridge.js | cut -c1-12); \
     sed -i "s#src=\"./web-bridge.js\"#src=\"./web-bridge.js?v=$H\"#" /usr/share/nginx/html/index.html; \
     grep -q "web-bridge.js?v=$H" /usr/share/nginx/html/index.html; \

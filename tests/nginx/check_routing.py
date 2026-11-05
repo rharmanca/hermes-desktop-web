@@ -107,11 +107,14 @@ c, hh, b = get("/desktop-plugins/profile-picker/plugin.js")
 check("approved plugin file served", c == 200 and b"@hermes/plugin-sdk" in b, f"{c}")
 c2, _, b2 = get("/desktop-plugins/waypoint/plugin.js")
 check("approved waypoint plugin served", c2 == 200 and b"@hermes/plugin-sdk" in b2, f"{c2}")
+c3, _, b3 = get("/desktop-plugins/gmail/plugin.js")
+check("approved gmail plugin served", c3 == 200 and b"@hermes/plugin-sdk" in b3, f"{c3}")
 for k, v in [("x-frame-options", "DENY"), ("x-content-type-options", "nosniff"), ("referrer-policy", "same-origin")]:
     check(f"plugin file: header {k}", hh.get(k) == v, f"{hh.get(k)!r}")
 for p in ["/desktop-plugins/", "/desktop-plugins/profile-picker/", "/desktop-plugins/profile-picker/LICENSE",
           "/desktop-plugins/SHA256SUMS", "/desktop-plugins/missing/plugin.js", "/desktop-plugins/profile-picker/other.js",
-          "/desktop-plugins/Evil/plugin.js", "/desktop-plugins/waypoint/LICENSE", "/desktop-plugins/waypoint/"]:
+          "/desktop-plugins/Evil/plugin.js", "/desktop-plugins/waypoint/LICENSE", "/desktop-plugins/waypoint/",
+          "/desktop-plugins/gmail/NOTICE", "/desktop-plugins/gmail/"]:
     c, _, b = get(p)
     check(f"{p} not served (404, no listing, no app page)", c in (400, 404) and b"web-bridge.js" not in b and b"Index of" not in b, f"{c}")
 for p in ["/desktop-plugins/../../../etc/passwd", "/desktop-plugins/%2e%2e/%2e%2e/%2e%2e/etc/passwd",

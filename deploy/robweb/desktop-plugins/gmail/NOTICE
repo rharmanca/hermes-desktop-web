@@ -1,0 +1,12 @@
+Gmail desktop plugin (not vendored)
+
+Upstream: https://github.com/guberm/hermes-gmail-desktop-plugin
+Commit:   c8cd0c2d140561a1dffb7432c6d02b63b2374888
+File:     plugins/gmail/desktop/plugin.js (version 1.0.20)
+SHA-256:  062af70aa6ce79baa3b4a231c5f934778b4682b6f1c4e3ceaecda6ee4cd0bf95
+
+The upstream plugin declares `license: Private` and ships no licence file, so
+this public repository does not redistribute its code. The image build fetches
+the file from the pinned upstream commit with `ADD --checksum`, and the build
+fails unless its bytes match the SHA-256 above (also in manifest.json and
+SHA256SUMS). Nothing is downloaded at runtime.

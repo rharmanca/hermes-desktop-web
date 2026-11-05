@@ -57,7 +57,7 @@ const served = (extra = {}) => ({
 // ── The committed bundle itself ──────────────────────────────────────────
 
 test('manifest lists exactly the reviewed plugins, in order', () => {
-  assert.deepEqual(MANIFEST.plugins.map(p => p.name), ['profile-picker', 'waypoint'])
+  assert.deepEqual(MANIFEST.plugins.map(p => p.name), ['profile-picker', 'waypoint', 'gmail'])
 })
 
 test('manifest pins waypoint to the reviewed upstream file and commit', () => {
@@ -80,7 +80,51 @@ test('manifest pins profile-picker to the reviewed upstream file and commit', ()
 test('SHA256SUMS (checked at image build) agrees with the manifest; licence ships with it', () => {
   const sums = readFileSync(new URL('SHA256SUMS', DIR), 'utf8').trim().split('\n')
   assert.deepEqual(sums, MANIFEST.plugins.map(p => `${p.sha256}  ${p.name}/plugin.js`))
-  for (const p of MANIFEST.plugins) assert.ok(existsSync(new URL(`${p.name}/LICENSE`, DIR)), p.name)
+  for (const p of MANIFEST.plugins) {
+    if (p.vendored === false) {
+      // Not redistributed here: a NOTICE explains why, and no plugin code is committed.
+      assert.ok(existsSync(new URL(`${p.name}/NOTICE`, DIR)), `${p.name} NOTICE`)
+      assert.ok(!existsSync(new URL(`${p.name}/plugin.js`, DIR)), `${p.name} must not be vendored`)
+    } else {
+      assert.ok(existsSync(new URL(`${p.name}/LICENSE`, DIR)), p.name)
+    }
+  }
+})
+
+// gmail (upstream licence: Private) is fetched at image build from the pinned
+// upstream commit; Docker's ADD --checksum fails the build on any byte change.
+const GMAIL_SHA = '062af70aa6ce79baa3b4a231c5f934778b4682b6f1c4e3ceaecda6ee4cd0bf95'
+const GMAIL_COMMIT = 'c8cd0c2d140561a1dffb7432c6d02b63b2374888'
+const GMAIL_RAW = `https://raw.githubusercontent.com/guberm/hermes-gmail-desktop-plugin/${GMAIL_COMMIT}/plugins/gmail/desktop/plugin.js`
+
+test('manifest and Dockerfile pin gmail to the reviewed upstream file, commit and checksum', () => {
+  const p = MANIFEST.plugins.find(x => x.name === 'gmail')
+  assert.equal(p.source, 'https://github.com/guberm/hermes-gmail-desktop-plugin')
+  assert.equal(p.commit, GMAIL_COMMIT)
+  assert.equal(p.version, '1.0.20')
+  assert.equal(p.sha256, GMAIL_SHA)
+  assert.equal(p.vendored, false)
+  assert.equal(p.fetch, GMAIL_RAW)
+  const docker = readFileSync(new URL('../deploy/robweb/Dockerfile', import.meta.url), 'utf8')
+  const adds = docker.split('\n').filter(l => /^ADD\b/.test(l))
+  assert.deepEqual(adds, [`ADD --checksum=sha256:${GMAIL_SHA} --chmod=644 ${GMAIL_RAW} /usr/share/nginx/html/desktop-plugins/gmail/plugin.js`])
+})
+
+// Reviewed exception, checked when a local copy is supplied (HDW_GMAIL_PLUGIN_JS=<path>):
+// no network/storage/eval/import; the only raw HTML use is parsing the backend-sanitised
+// email body into a detached inert <template>, which React then rebuilds from an allowlist.
+test('gmail plugin (local copy, optional) matches the pin and the reviewed browser surface', { skip: !process.env.HDW_GMAIL_PLUGIN_JS }, () => {
+  const buf = readFileSync(process.env.HDW_GMAIL_PLUGIN_JS)
+  assert.equal(sha(buf), GMAIL_SHA)
+  const src = buf.toString('utf8')
+  for (const bad of [/\bfetch\s*\(/, /XMLHttpRequest/, /WebSocket/, /\beval\s*\(/, /new\s+Function\s*\(/,
+    /localStorage|sessionStorage|indexedDB/, /import\s*\(/, /outerHTML|insertAdjacentHTML|dangerouslySetInnerHTML/,
+    /postMessage|BroadcastChannel|sendBeacon|EventSource/, /window\.open/]) {
+    assert.doesNotMatch(src, bad, String(bad))
+  }
+  assert.deepEqual(src.match(/[\w.]+\.innerHTML\s*=/g), ['fragment.innerHTML ='])
+  assert.deepEqual(src.match(/document\.createElement\('[a-z]+'\)/g), ["document.createElement('template')"])
+  assert.deepEqual([...new Set(src.match(/host\.request\('([a-z.]+)'/g) || [])], [])
 })
 
 // Waypoint reviewed exception: read-only layout measurement to place its card
@@ -121,7 +165,8 @@ test('root, listing and entry follow the manifest only', async () => {
   const root = await d.readDir('/desktop-plugins')
   assert.deepEqual(JSON.parse(JSON.stringify(root.entries)), [
     { name: 'profile-picker', path: '/desktop-plugins/profile-picker', isDirectory: true },
-    { name: 'waypoint', path: '/desktop-plugins/waypoint', isDirectory: true }
+    { name: 'waypoint', path: '/desktop-plugins/waypoint', isDirectory: true },
+    { name: 'gmail', path: '/desktop-plugins/gmail', isDirectory: true }
   ])
   const folder = await d.readDir('/desktop-plugins/profile-picker')
   assert.deepEqual(JSON.parse(JSON.stringify(folder.entries)), [{ name: 'plugin.js', path: '/desktop-plugins/profile-picker/plugin.js', isDirectory: false }])

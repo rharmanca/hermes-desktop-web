@@ -18,6 +18,17 @@
       "source": "https://github.com/mochiNJ/hermes-waypoint",
       "commit": "971bab6762466bfdf6036aeaeb35352d6308f61d",
       "path": "desktop/plugin.js"
+    },
+    {
+      "name": "gmail",
+      "sha256": "062af70aa6ce79baa3b4a231c5f934778b4682b6f1c4e3ceaecda6ee4cd0bf95",
+      "version": "1.0.20",
+      "license": "Private (not redistributed; fetched from upstream at build)",
+      "source": "https://github.com/guberm/hermes-gmail-desktop-plugin",
+      "commit": "c8cd0c2d140561a1dffb7432c6d02b63b2374888",
+      "path": "plugins/gmail/desktop/plugin.js",
+      "vendored": false,
+      "fetch": "https://raw.githubusercontent.com/guberm/hermes-gmail-desktop-plugin/c8cd0c2d140561a1dffb7432c6d02b63b2374888/plugins/gmail/desktop/plugin.js"
     }
   ]
 }
