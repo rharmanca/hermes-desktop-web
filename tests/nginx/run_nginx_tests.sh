@@ -17,7 +17,18 @@ printf '<html><head><script src="./web-bridge.js?v=test"></script></head><body>a
 mkdir -p "$WWW/assets"; python3 -c "print('console.log(1);'*500)" > "$WWW/assets/app-Ab12Cd.js"
 cp "$ROOT/web-bridge.js" "$ROOT/deploy/robweb/web-preview.js" "$WWW/"
 # Same desktop-plugins files the image ships, plus extras that must NOT be served.
-cp -r "$ROOT/deploy/robweb/desktop-plugins" "$WWW/desktop-plugins"; chmod -R a+rX "$WWW"
+cp -r "$ROOT/deploy/robweb/desktop-plugins" "$WWW/desktop-plugins"
+# Non-vendored plugins: fetch from the pinned upstream URL and verify the checksum, as the image's ADD does.
+python3 - "$WWW/desktop-plugins" <<'PY'
+import hashlib, json, sys, urllib.request
+d = sys.argv[1]
+for p in json.load(open(f"{d}/manifest.json"))["plugins"]:
+    if p.get("vendored") is False:
+        body = urllib.request.urlopen(p["fetch"], timeout=60).read()
+        assert hashlib.sha256(body).hexdigest() == p["sha256"], f"{p['name']}: checksum mismatch"
+        open(f"{d}/{p['name']}/plugin.js", "wb").write(body)
+PY
+chmod -R a+rX "$WWW"
 
 docker network create "$ID" >/dev/null
 docker run -d --name "$ID-stub" --network "$ID" --network-alias host.docker.internal \
